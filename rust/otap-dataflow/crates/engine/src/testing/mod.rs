@@ -149,18 +149,12 @@ impl CtrlMsgCounters {
     }
 }
 
-/// A wrapper function used to enforce the Send constraint.
-/// This is useful for testing nodes that require a Send EffectHandler.
-pub fn exec_in_send_env<F>(f: F)
-where
-    F: FnOnce() -> () + Send,
-{
-    f();
-}
-
 /// Creates a single-threaded runtime with a local task set for testing components.
 pub fn setup_test_runtime() -> (tokio::runtime::Runtime, LocalSet) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create new runtime");
     let local_tasks = LocalSet::new();
     (rt, local_tasks)
 }
@@ -170,13 +164,4 @@ pub fn setup_test_runtime() -> (tokio::runtime::Runtime, LocalSet) {
 /// This function creates a sender-receiver pair with the given capacity.
 pub fn create_not_send_channel<T>(capacity: usize) -> (mpsc::Sender<T>, mpsc::Receiver<T>) {
     mpsc::Channel::new(capacity)
-}
-
-/// Helper to create `Send` MPSC channels with a specific capacity.
-///
-/// This function creates a sender-receiver pair with the given capacity.
-pub fn create_send_channel<T>(
-    capacity: usize,
-) -> (tokio::sync::mpsc::Sender<T>, tokio::sync::mpsc::Receiver<T>) {
-    tokio::sync::mpsc::channel(capacity)
 }

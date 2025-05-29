@@ -43,14 +43,14 @@ impl HistogramDataPointsStore {
         let time_unix_nano = get_timestamp_nanosecond_array(rb, consts::TIME_UNIX_NANO)?;
         let histogram_count = get_u64_array(rb, consts::HISTOGRAM_COUNT)?;
         let sum = get_f64_array_opt(rb, consts::HISTOGRAM_SUM)?;
-        let bucket_counts_arr: ListValueAccessor<UInt64Type> = ListValueAccessor::try_new(
+        let bucket_counts_arr: ListValueAccessor<'_, UInt64Type> = ListValueAccessor::try_new(
             rb.column_by_name(consts::HISTOGRAM_BUCKET_COUNTS).context(
                 error::ColumnNotFoundSnafu {
                     name: consts::HISTOGRAM_BUCKET_COUNTS,
                 },
             )?,
         )?;
-        let explicit_bounds_arr: ListValueAccessor<Float64Type> = ListValueAccessor::try_new(
+        let explicit_bounds_arr: ListValueAccessor<'_, Float64Type> = ListValueAccessor::try_new(
             rb.column_by_name(consts::HISTOGRAM_EXPLICIT_BOUNDS)
                 .context(error::ColumnNotFoundSnafu {
                     name: consts::HISTOGRAM_EXPLICIT_BOUNDS,
@@ -138,6 +138,7 @@ where
         Ok(Self { list, value })
     }
 
+    #[must_use]
     pub fn value_at_opt(&self, idx: usize) -> Option<Vec<T::Native>> {
         if !self.list.is_valid(idx) {
             return None;
@@ -147,6 +148,7 @@ where
         let vec = (start..end)
             .map(|idx| self.value.value_at(idx).unwrap_or_default())
             .collect();
+
         Some(vec)
     }
 }

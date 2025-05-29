@@ -15,8 +15,10 @@ use crate::arrays::{
     get_u8_array, get_u16_array,
 };
 use crate::error;
+use crate::otap::OtapBatch;
 use crate::otlp::common::{ResourceArrays, ScopeArrays};
 use crate::otlp::metrics::related_data::RelatedData;
+use crate::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use crate::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
 use crate::proto::opentelemetry::metrics::v1::metric;
 use crate::schema::consts;
@@ -26,7 +28,7 @@ use snafu::{OptionExt, ResultExt};
 
 pub mod data_points;
 pub mod exemplar;
-pub mod related_data;
+mod related_data;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, TryFromPrimitive)]
 #[repr(u8)]
@@ -93,10 +95,7 @@ impl<'a> TryFrom<&'a RecordBatch> for MetricsArrays<'a> {
 }
 
 /// Builds [ExportMetricsServiceRequest] from given record batch.
-pub fn metrics_from(
-    rb: &RecordBatch,
-    related_data: &mut RelatedData,
-) -> error::Result<ExportMetricsServiceRequest> {
+pub fn metrics_from(metrics_otap_batch: OtapBatch) -> error::Result<ExportMetricsServiceRequest> {
     let mut metrics = ExportMetricsServiceRequest::default();
 
     let mut prev_res_id: Option<u16> = None;
@@ -104,6 +103,11 @@ pub fn metrics_from(
 
     let mut res_id = 0;
     let mut scope_id = 0;
+
+    let rb = metrics_otap_batch
+        .get(ArrowPayloadType::UnivariateMetrics)
+        .context(error::MetricRecordNotFoundSnafu)?;
+    let mut related_data = RelatedData::try_from(&metrics_otap_batch)?;
 
     let resource_arrays = ResourceArrays::try_from(rb)?;
     let scope_arrays = ScopeArrays::try_from(rb)?;
@@ -127,12 +131,13 @@ pub fn metrics_from(
                 resource.dropped_attributes_count = dropped_attributes_count;
             }
 
-            if let Some(res_id) = resource_arrays.id.value_at(idx)
-                && let Some(attrs) = related_data
+            if let Some(res_id) = resource_arrays.id.value_at(idx) {
+                if let Some(attrs) = related_data
                     .res_attr_map_store
                     .attribute_by_delta_id(res_id)
-            {
-                resource.attributes = attrs.to_vec();
+                {
+                    resource.attributes = attrs.to_vec();
+                }
             }
 
             res_metrics.schema_url = resource_arrays.schema_url.value_at(idx).unwrap_or_default();
@@ -151,12 +156,13 @@ pub fn metrics_from(
                 .scope_metrics;
             let scope_metrics = current_scope_metrics_slice.append_and_get();
             let mut scope = scope_arrays.create_instrumentation_scope(idx);
-            if let Some(scope_id) = scope_delta_id_opt
-                && let Some(attrs) = related_data
+            if let Some(scope_id) = scope_delta_id_opt {
+                if let Some(attrs) = related_data
                     .scope_attr_map_store
                     .attribute_by_delta_id(scope_id)
-            {
-                scope.attributes = attrs.to_vec();
+                {
+                    scope.attributes = attrs.to_vec();
+                }
             }
             scope_metrics.scope = Some(scope);
             // ScopeMetrics uses the schema_url from metrics arrays.
@@ -257,6 +263,6 @@ where
 {
     fn append_and_get(&mut self) -> &mut T {
         self.push(T::default());
-        self.last_mut().unwrap()
+        self.last_mut().expect("vec is not empty")
     }
 }

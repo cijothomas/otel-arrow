@@ -34,19 +34,6 @@ import (
 // ToDo Standard attributes (i.e. AttributesDT) will be removed in the future. They are still used as shared attributes in the metrics.
 // ToDo this file must be redistributed into `attributes_16.go` and `attributes_32.go` files.
 
-// ParentID encodings
-const (
-	// ParentIdNoEncoding stores the parent ID as is.
-	ParentIdNoEncoding = iota
-	// ParentIdDeltaEncoding stores the parent ID as a delta from the previous
-	// parent ID.
-	ParentIdDeltaEncoding
-	// ParentIdDeltaGroupEncoding stores the parent ID as a delta from the
-	// previous parent ID in the same group. A group is defined by the
-	// combination Key and Value.
-	ParentIdDeltaGroupEncoding
-)
-
 // Arrow data types used to build the attribute map.
 var (
 	// KDT is the Arrow key data type.
@@ -326,6 +313,9 @@ func (c *Attributes32Accumulator) Reset() {
 
 func Equal(a, b *pcommon.Value) bool {
 	if a == nil || b == nil {
+		// TODO: in the future we may want to reconsider whether wo nil values
+		// are equal for purpose of delta encoding parent IDs.
+		// see https://github.com/open-telemetry/otel-arrow/issues/463
 		return false
 	}
 

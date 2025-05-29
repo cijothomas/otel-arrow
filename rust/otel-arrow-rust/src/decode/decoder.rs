@@ -12,16 +12,16 @@
 
 use crate::decode::record_message::RecordMessage;
 use crate::error;
+use crate::otap::{OtapBatch, from_record_messages};
 use crate::otlp::logs::logs_from;
-use crate::otlp::logs::related_data::RelatedData as LogsRelatedData;
-use crate::otlp::metrics::{metrics_from, related_data::RelatedData as MetricsRelatedData};
+use crate::otlp::metrics::metrics_from;
 use crate::proto::opentelemetry::arrow::v1::{ArrowPayload, ArrowPayloadType, BatchArrowRecords};
 use crate::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
 use crate::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
 use arrow::array::RecordBatch;
 use arrow::error::ArrowError;
 use arrow::ipc::reader::StreamReader;
-use snafu::{OptionExt, ResultExt, ensure};
+use snafu::{ResultExt, ensure};
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -50,13 +50,18 @@ impl StreamConsumer {
     }
 }
 
+/// Consumer consumes OTAP `BatchArrowRecords` and converts them into OTLP messages.
 #[derive(Default)]
 pub struct Consumer {
     stream_consumers: HashMap<String, StreamConsumer>,
 }
 
 impl Consumer {
-    fn consume_bar(&mut self, bar: &mut BatchArrowRecords) -> error::Result<Vec<RecordMessage>> {
+    /// consume and deserialize record batches
+    pub fn consume_bar(
+        &mut self,
+        bar: &mut BatchArrowRecords,
+    ) -> error::Result<Vec<RecordMessage>> {
         let mut records = Vec::with_capacity(bar.arrow_payloads.len());
 
         for payload in std::mem::take(&mut bar.arrow_payloads) {
@@ -105,17 +110,18 @@ impl Consumer {
         Ok(records)
     }
 
+    /// Consumes all the arrow payloads in the passed OTAP `BatchArrayRecords` and decodes them
+    /// into OTLP messages, then constructs the `ExportMetricsServiceRequest` containing the
+    /// metrics messages
     pub fn consume_metrics_batches(
         &mut self,
         records: &mut BatchArrowRecords,
     ) -> error::Result<ExportMetricsServiceRequest> {
         match get_main_payload_type(records)? {
             ArrowPayloadType::UnivariateMetrics => {
-                let record_message = self.consume_bar(records)?;
-                let (mut related_data, metric_record) =
-                    MetricsRelatedData::from_record_messages(&record_message)?;
-                let metric_rec_idx = metric_record.context(error::MetricRecordNotFoundSnafu)?;
-                metrics_from(&record_message[metric_rec_idx].record, &mut related_data)
+                let record_messages = self.consume_bar(records)?;
+                let otap_batch = OtapBatch::Metrics(from_record_messages(record_messages));
+                metrics_from(otap_batch)
             }
             main_record_type => error::UnsupportedPayloadTypeSnafu {
                 actual: main_record_type,
@@ -124,17 +130,18 @@ impl Consumer {
         }
     }
 
+    /// Consumes all the arrow payloads in the passed OTAP `BatchArrayRecords` and decodes them
+    /// into OTLP messages, then constructs the `ExportLogsServiceRequest` containing the
+    /// logs messages
     pub fn consume_logs_batches(
         &mut self,
         records: &mut BatchArrowRecords,
     ) -> error::Result<ExportLogsServiceRequest> {
         match get_main_payload_type(records)? {
             ArrowPayloadType::Logs => {
-                let record_message = self.consume_bar(records)?;
-                let (mut related_data, log_record) =
-                    LogsRelatedData::from_record_messages(&record_message)?;
-                let log_rec_idx = log_record.context(error::LogRecordNotFoundSnafu)?;
-                logs_from(&record_message[log_rec_idx].record, &mut related_data)
+                let record_messages = self.consume_bar(records)?;
+                let otap_batch = OtapBatch::Logs(from_record_messages(record_messages));
+                logs_from(otap_batch)
             }
             main_record_type => error::UnsupportedPayloadTypeSnafu {
                 actual: main_record_type,
