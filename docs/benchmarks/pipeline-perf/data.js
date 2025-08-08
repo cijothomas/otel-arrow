@@ -1,6 +1,6 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1754673839871,
-  "repoUrl": "https://github.com/open-telemetry/otel-arrow",
+  "lastUpdate": 1754675489500,
+  "repoUrl": "https://github.com/cijothomas/otel-arrow",
   "entries": {
     "Benchmark": [
       {
@@ -7244,6 +7244,38 @@ window.BENCHMARK_DATA = {
             "name": "pipeline-perf-collector-config-with-batch-processor-memory-max",
             "value": 207.5,
             "unit": "MiB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Cijo Thomas",
+            "username": "cijothomas",
+            "email": "cithomas@microsoft.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "c2da831e9b72f868d46a15c0fe63b80c624fbc89",
+          "message": "Merge pull request #1 from cijothomas/cijothomas/ci-publish-bench\n\nCijothomas/ci publish bench",
+          "timestamp": "2025-05-29T22:12:40Z",
+          "url": "https://github.com/cijothomas/otel-arrow/commit/c2da831e9b72f868d46a15c0fe63b80c624fbc89"
+        },
+        "date": 1754675487911,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "pipeline-perf-collector-config-throughput",
+            "value": 455666.6666666667,
+            "unit": "logs/sec"
+          },
+          {
+            "name": "pipeline-perf-collector-config-with-batch-processor-throughput",
+            "value": 463833.3333333333,
+            "unit": "logs/sec"
           }
         ]
       }
