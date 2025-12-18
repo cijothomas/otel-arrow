@@ -338,7 +338,7 @@ jobs:
               EOF
 
           - name: Update pipeline benchmark data and deploy to GitHub Pages
-            uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
+            uses: benchmark-action/github-action-benchmark@d48d326b4ca0d0d59f108f9e02a381c7
             with:
               tool: "customSmallerIsBetter"
               output-file-path: output-pipeline.json
@@ -350,7 +350,7 @@ jobs:
               save-data-file: true
 
           - name: Update saturation benchmark data and deploy to GitHub Pages
-            uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
+            uses: benchmark-action/github-action-benchmark@d48d326b4ca0d0d59f108f9e02a381c7
             with:
               tool: "customSmallerIsBetter"
               output-file-path: output-saturation.json
