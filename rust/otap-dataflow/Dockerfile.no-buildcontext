@@ -1,0 +1,49 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Alternative Dockerfile that can be built without --build-context
+# Build from the repository root with:
+# docker build -f rust/otap-dataflow/Dockerfile.no-buildcontext -t df_engine .
+FROM docker.io/rust:1.91@sha256:4a29b0db5c961cd530f39276ece3eb6e66925b59599324c8c19723b72a423615 AS dataflow-build
+WORKDIR /build/rust/dataflow
+ARG BUILDPLATFORM=linux/amd64
+ARG TARGETPLATFORM=linux/amd64
+
+RUN apt-get update && apt-get install -y protobuf-compiler
+
+# Copy proto files from repository root
+COPY proto/opentelemetry/proto /build/proto/opentelemetry/proto
+COPY proto/opentelemetry-proto /build/proto/opentelemetry-proto
+
+# Copy the experimental query engine (dependency of query-engine crate)
+COPY rust/experimental /build/rust/experimental
+
+# Copy the dataflow source
+COPY rust/otap-dataflow /build/rust/dataflow/.
+
+# RUSTFLAGS can be used to pass argument to rustc e.g. 
+# --build-arg RUSTFLAGS="-C target-feature=-gfni"
+ARG RUSTFLAGS="-C target-cpu=native"
+ENV RUSTFLAGS=${RUSTFLAGS}
+
+# These are used to enable features and are passed to carg's --features argument
+# e.g. --build-arg FEATURES="azure,quiver-persistence"
+ARG FEATURES=""
+ENV FEATURES=${FEATURES}
+
+# Build dataflow engine
+RUN ./cross-arch-build.sh
+
+# The runtime image
+FROM docker.io/alpine:3.22@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
+LABEL maintainer="The OpenTelemetry Authors"
+RUN addgroup dataflow \
+  && adduser \
+  --ingroup dataflow \
+  --disabled-password \
+  dataflow
+WORKDIR /home/dataflow
+
+COPY --from=dataflow-build --chown=dataflow:dataflow /build/rust/dataflow/df_engine .
+USER dataflow
+ENTRYPOINT ["/home/dataflow/df_engine"]
