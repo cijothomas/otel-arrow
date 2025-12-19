@@ -11,7 +11,7 @@ on:
 
 jobs:
     pipeline-perf-test:
-        runs-on: ubuntu-latest
+        runs-on: oracle-bare-metal-64cpu-512gb-x86-64
         steps:
         - name: Harden the runner (Audit all outbound calls)
           uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2 # v2.13.2
@@ -98,16 +98,20 @@ jobs:
             cd tools/pipeline_perf_test
             python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-2cores.yaml
 
-        # Skip 4-core and 8-core tests on ubuntu-latest (only has 2 cores)
-        # - name: Run pipeline performance test - Saturation 4 Cores
-        #   run: |
-        #     cd tools/pipeline_perf_test
-        #     python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-4cores.yaml
+        - name: Run pipeline performance test - Saturation 4 Cores
+          run: |
+            cd tools/pipeline_perf_test
+            python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-4cores.yaml
 
-        # - name: Run pipeline performance test - Saturation 8 Cores
-        #   run: |
-        #     cd tools/pipeline_perf_test
-        #     python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-8cores.yaml
+        - name: Run pipeline performance test - Saturation 8 Cores
+          run: |
+            cd tools/pipeline_perf_test
+            python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-8cores.yaml
+
+        - name: Run pipeline performance test - Saturation 16 Cores
+          run: |
+            cd tools/pipeline_perf_test
+            python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-16cores.yaml
 
         # Skip pipeline benchmark upload - only testing saturation
         # - name: Upload benchmark results for processing
@@ -153,22 +157,9 @@ jobs:
               merge-multiple: true
               path: results-saturation
 
-          # Skip pipeline benchmark consolidation - only testing saturation
-          # - name: Consolidate pipeline benchmark data
-          #   run: |
-          #     bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-pipeline output-pipeline.json
-
           - name: Consolidate saturation benchmark data
             run: |
-              bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-saturation output-saturation.json
-
-          - name: Compute scaling efficiency metrics
-            run: |
-              python3 .github/workflows/scripts/compute-scaling-metrics.py output-saturation.json output-saturation.json
-
-          - name: Generate scaling analysis summary
-            run: |
-              python3 .github/workflows/scripts/generate-scaling-summary.py output-saturation.json
+              find results-saturation -name '*.json' -exec cat {} \; | jq -s 'add' > output-saturation.json
 
           # Skip pipeline benchmark deployment - only testing saturation
           # - name: Update pipeline benchmark data and deploy to GitHub Pages
