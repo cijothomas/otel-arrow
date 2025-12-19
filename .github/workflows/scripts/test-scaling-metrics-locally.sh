@@ -14,35 +14,23 @@ echo "Repository root: $REPO_ROOT"
 echo "Results directory: $RESULTS_DIR"
 echo ""
 
-# Step 1: Consolidate benchmark data
-echo "Step 1: Consolidating saturation benchmark data..."
 cd "$RESULTS_DIR"
 
-# Find and combine all saturation benchmark JSON files
-find . -path '*/continuous_saturation_*/gh-actions-benchmark/*.json' -type f -exec cat {} \; | \
-  jq -s 'map(.[])' > combined-saturation-benchmarks.json
-
-ENTRY_COUNT=$(jq '. | length' combined-saturation-benchmarks.json)
-echo "✓ Consolidated $ENTRY_COUNT benchmark entries"
+# Step 1: Consolidate benchmark data (matching CI exactly)
+echo "Step 1: Consolidating saturation benchmark data..."
+bash "$SCRIPT_DIR/consolidate-benchmarks.sh" . output-saturation.json
 echo ""
 
-# Step 2: Compute scaling metrics
+# Step 2: Compute scaling metrics (matching CI exactly)
 echo "Step 2: Computing scaling efficiency metrics..."
 python3 "$SCRIPT_DIR/compute-scaling-metrics.py" \
-  combined-saturation-benchmarks.json \
-  combined-saturation-with-metrics.json
-
+  output-saturation.json \
+  output-saturation.json
 echo ""
 
-# Step 3: Generate summary
+# Step 3: Generate summary (matching CI exactly)
 echo "Step 3: Generating scaling analysis summary..."
-python3 "$SCRIPT_DIR/generate-scaling-summary.py" \
-  combined-saturation-with-metrics.json \
-  scaling-summary.md
+python3 "$SCRIPT_DIR/generate-scaling-summary.py" output-saturation.json
+echo ""
 
-echo ""
-echo "==> Summary also saved to: $RESULTS_DIR/scaling-summary.md"
-echo ""
-cat "$RESULTS_DIR/scaling-summary.md"
-echo ""
 echo "==> Done! Check the output above for scaling analysis."

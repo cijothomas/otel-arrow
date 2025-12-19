@@ -109,11 +109,12 @@ jobs:
         #     cd tools/pipeline_perf_test
         #     python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-8cores.yaml
 
-        - name: Upload benchmark results for processing
-          uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-          with:
-            name: benchmark-results-pipeline
-            path: tools/pipeline_perf_test/results/integration/gh-actions-benchmark/*.json
+        # Skip pipeline benchmark upload - only testing saturation
+        # - name: Upload benchmark results for processing
+        #   uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        #   with:
+        #     name: benchmark-results-pipeline
+        #     path: tools/pipeline_perf_test/results/integration/gh-actions-benchmark/*.json
 
         - name: Upload benchmark results for processing (Saturation)
           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -137,12 +138,13 @@ jobs:
         steps:
           - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-          - name: Download benchmark artifacts
-            uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-            with:
-              pattern: benchmark-results-pipeline*
-              merge-multiple: true
-              path: results-pipeline
+          # Skip pipeline benchmark download - only testing saturation
+          # - name: Download benchmark artifacts
+          #   uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+          #   with:
+          #     pattern: benchmark-results-pipeline*
+          #     merge-multiple: true
+          #     path: results-pipeline
 
           - name: Download benchmark artifacts (Saturation)
             uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -151,9 +153,10 @@ jobs:
               merge-multiple: true
               path: results-saturation
 
-          - name: Consolidate pipeline benchmark data
-            run: |
-              bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-pipeline output-pipeline.json
+          # Skip pipeline benchmark consolidation - only testing saturation
+          # - name: Consolidate pipeline benchmark data
+          #   run: |
+          #     bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-pipeline output-pipeline.json
 
           - name: Consolidate saturation benchmark data
             run: |
@@ -167,17 +170,18 @@ jobs:
             run: |
               python3 .github/workflows/scripts/generate-scaling-summary.py output-saturation.json
 
-          - name: Update pipeline benchmark data and deploy to GitHub Pages
-            uses: benchmark-action/github-action-benchmark@d48d326b4ca9ba73ca0cd0d59f108f9e02a381c7
-            with:
-              tool: "customSmallerIsBetter"
-              output-file-path: output-pipeline.json
-              gh-pages-branch: benchmarks
-              max-items-in-chart: 100
-              github-token: ${{ secrets.GITHUB_TOKEN }}
-              benchmark-data-dir-path: "docs/benchmarks/continuous"
-              auto-push: true
-              save-data-file: true
+          # Skip pipeline benchmark deployment - only testing saturation
+          # - name: Update pipeline benchmark data and deploy to GitHub Pages
+          #   uses: benchmark-action/github-action-benchmark@d48d326b4ca9ba73ca0cd0d59f108f9e02a381c7
+          #   with:
+          #     tool: "customSmallerIsBetter"
+          #     output-file-path: output-pipeline.json
+          #     gh-pages-branch: benchmarks
+          #     max-items-in-chart: 100
+          #     github-token: ${{ secrets.GITHUB_TOKEN }}
+          #     benchmark-data-dir-path: "docs/benchmarks/continuous"
+          #     auto-push: true
+          #     save-data-file: true
 
           - name: Update saturation benchmark data and deploy to GitHub Pages
             uses: benchmark-action/github-action-benchmark@d48d326b4ca9ba73ca0cd0d59f108f9e02a381c7
@@ -194,5 +198,4 @@ jobs:
           - name: Add benchmark link to job summary
             run: |
               echo "### Benchmark Results" >> $GITHUB_STEP_SUMMARY
-              echo "[View the pipeline benchmark results here](https://open-telemetry.github.io/otel-arrow/benchmarks/continuous/)" >> $GITHUB_STEP_SUMMARY
               echo "[View the saturation benchmark results here](https://open-telemetry.github.io/otel-arrow/benchmarks/continuous-saturation/)" >> $GITHUB_STEP_SUMMARY
