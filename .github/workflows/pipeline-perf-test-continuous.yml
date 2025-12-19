@@ -159,7 +159,7 @@ jobs:
 
           - name: Consolidate saturation benchmark data
             run: |
-              find results-saturation -name '*.json' -exec cat {} \; | jq -s 'add' > output-saturation.json
+              bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-saturation output-saturation.json
 
           # Skip pipeline benchmark deployment - only testing saturation
           # - name: Update pipeline benchmark data and deploy to GitHub Pages
