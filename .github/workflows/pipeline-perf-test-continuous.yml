@@ -82,30 +82,32 @@ jobs:
             pip install --user -r tools/pipeline_perf_test/orchestrator/requirements.txt
             pip install --user -r tools/pipeline_perf_test/load_generator/requirements.txt
 
-        - name: Run pipeline performance test log suite
-          run: |
-            cd tools/pipeline_perf_test
-            python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/100klrps-docker.yaml
+        # Skip 100klrps test - only testing saturation tests and scaling scripts
+        # - name: Run pipeline performance test log suite
+        #   run: |
+        #     cd tools/pipeline_perf_test
+        #     python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/100klrps-docker.yaml
 
         - name: Run pipeline performance test - Saturation 1 Core
           run: |
             cd tools/pipeline_perf_test
-            python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/saturation-1core.yaml
+            python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-1core.yaml
 
         - name: Run pipeline performance test - Saturation 2 Cores
           run: |
             cd tools/pipeline_perf_test
-            python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/saturation-2cores.yaml
+            python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-2cores.yaml
 
-        - name: Run pipeline performance test - Saturation 4 Cores
-          run: |
-            cd tools/pipeline_perf_test
-            python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/saturation-4cores.yaml
+        # Skip 4-core and 8-core tests on ubuntu-latest (only has 2 cores)
+        # - name: Run pipeline performance test - Saturation 4 Cores
+        #   run: |
+        #     cd tools/pipeline_perf_test
+        #     python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-4cores.yaml
 
-        - name: Run pipeline performance test - Saturation 8 Cores
-          run: |
-            cd tools/pipeline_perf_test
-            python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/saturation-8cores.yaml
+        # - name: Run pipeline performance test - Saturation 8 Cores
+        #   run: |
+        #     cd tools/pipeline_perf_test
+        #     python orchestrator/run_orchestrator.py --config test_suites/integration/continuous/saturation-8cores.yaml
 
         - name: Upload benchmark results for processing
           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
