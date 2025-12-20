@@ -73,6 +73,8 @@ jobs:
             cd rust/otap-dataflow
             docker build --build-context otel-arrow=../../ -f Dockerfile -t df_engine .
             cd ../..
+            echo "df_engine binary size:"
+            docker run --rm df_engine ls -lh /home/dataflow/df_engine
 
         - name: Install dependencies
           run: |
@@ -90,6 +92,11 @@ jobs:
             cd tools/pipeline_perf_test
             python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/saturation-docker.yaml
 
+        - name: Run pipeline performance test - Idle
+          run: |
+            cd tools/pipeline_perf_test
+            python orchestrator/run_orchestrator.py --debug --config test_suites/integration/continuous/idle-docker.yaml
+
         - name: Upload benchmark results for processing
           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
           with:
@@ -101,6 +108,12 @@ jobs:
           with:
             name: benchmark-results-saturation
             path: tools/pipeline_perf_test/results/continuous_saturation/gh-actions-benchmark/*.json
+
+        - name: Upload benchmark results for processing (Idle)
+          uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          with:
+            name: benchmark-results-idle
+            path: tools/pipeline_perf_test/results/continuous_idle/gh-actions-benchmark/*.json
 
         - name: Add benchmark link to job summary
           run: |
@@ -132,6 +145,13 @@ jobs:
               merge-multiple: true
               path: results-saturation
 
+          - name: Download benchmark artifacts (Idle)
+            uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+            with:
+              pattern: benchmark-results-idle*
+              merge-multiple: true
+              path: results-idle
+
           - name: Consolidate pipeline benchmark data
             run: |
               bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-pipeline output-pipeline.json
@@ -139,6 +159,10 @@ jobs:
           - name: Consolidate saturation benchmark data
             run: |
               bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-saturation output-saturation.json
+
+          - name: Consolidate idle benchmark data
+            run: |
+              bash ./.github/workflows/scripts/consolidate-benchmarks.sh results-idle output-idle.json
 
           - name: Update pipeline benchmark data and deploy to GitHub Pages
             uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
@@ -164,8 +188,21 @@ jobs:
               auto-push: true
               save-data-file: true
 
+          - name: Update idle benchmark data and deploy to GitHub Pages
+            uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1.20.7
+            with:
+              tool: "customSmallerIsBetter"
+              output-file-path: output-idle.json
+              gh-pages-branch: benchmarks
+              max-items-in-chart: 100
+              github-token: ${{ secrets.GITHUB_TOKEN }}
+              benchmark-data-dir-path: "docs/benchmarks/continuous-idle"
+              auto-push: true
+              save-data-file: true
+
           - name: Add benchmark link to job summary
             run: |
               echo "### Benchmark Results" >> $GITHUB_STEP_SUMMARY
               echo "[View the pipeline benchmark results here](https://open-telemetry.github.io/otel-arrow/benchmarks/continuous/)" >> $GITHUB_STEP_SUMMARY
               echo "[View the saturation benchmark results here](https://open-telemetry.github.io/otel-arrow/benchmarks/continuous-saturation/)" >> $GITHUB_STEP_SUMMARY
+              echo "[View the idle benchmark results here](https://open-telemetry.github.io/otel-arrow/benchmarks/continuous-idle/)" >> $GITHUB_STEP_SUMMARY

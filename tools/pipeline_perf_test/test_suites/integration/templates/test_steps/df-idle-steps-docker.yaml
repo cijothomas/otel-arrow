@@ -1,0 +1,105 @@
+steps:
+  - name: Deploy Backend Engine
+    action:
+      component_action:
+        phase: deploy
+        target: backend-service
+    hooks:
+      run:
+        pre:
+          # Render the engine config into the suite config directory
+          - render_template:
+              template_path: './test_suites/integration/templates/configs/backend/config.yaml.j2'
+              output_path: ./test_suites/integration/configs/backend/config.rendered.yaml
+              variables:
+                backend_receiver_type: '{{backend_receiver_type}}'
+        post:
+          # Wait for the telemetry endpoint to be active (TODO: switch to healthcheck endpoint when available).
+          - ready_check_http:
+              url: http://localhost:8087/telemetry/metrics?reset=false
+              method: GET
+              expected_status_code: 200
+  - name: Deploy Dataflow Engine
+    action:
+      component_action:
+        phase: deploy
+        target: df-engine
+    hooks:
+      run:
+        pre:
+          # Render the engine config into the suite config directory
+          - render_template:
+              template_path: '{{engine_config_template}}'
+              output_path: ./test_suites/integration/configs/engine/config.rendered.yaml
+              variables:
+                backend_hostname: backend-service
+        post:
+          # Wait for the telemetry endpoint to be active (TODO: switch to healthcheck endpoint when available).
+          - ready_check_http:
+              url: http://localhost:8086/telemetry/metrics?reset=false
+              method: GET
+              expected_status_code: 200
+  - name: Monitor All
+    action:
+      multi_component_action:
+        phase: start_monitoring
+        targets:
+          - backend-service
+          - df-engine
+  - name: Wait for stabilization
+    action:
+      wait:
+        delay_seconds: {{wait_for_stabilization | default(10)}}
+  # This is the main observation window, marked by custom events at start/stop
+  - name: Observe Idle State
+    action:
+      wait:
+        delay_seconds: {{observation_interval | default(60)}}
+    hooks:
+      run:
+        pre:
+          - record_event:
+              name: observation_start
+        post:
+          - record_event:
+              name: observation_stop
+  # Stop monitoring all components.
+  - name: Stop Monitoring All
+    action:
+      multi_component_action:
+        phase: stop_monitoring
+        targets:
+          - backend-service
+          - df-engine
+  # Stop all running components.
+  - name: Destroy All
+    action:
+      multi_component_action:
+        phase: destroy
+        targets:
+          - df-engine
+          - backend-service
+  # Run the report
+  - name: Run Report
+    action:
+      wait:
+        delay_seconds: 0
+    hooks:
+      run:
+        post:
+          # Print all Docker container logs
+          - print_container_logs: {}
+          - sql_report:
+              name: Integration Report - Idle
+              report_config_file: ./test_suites/integration/configs/idle_report.yaml
+              output:
+                - format:
+                    template: {}
+                  destination:
+                    console: {}
+                - format:
+                    template:
+                      path:  ./test_suites/integration/templates/reports/gh-action-idle-report.j2
+                  destination:
+                    file:
+                      directory: results/{{result_dir | default('idle')}}/gh-actions-benchmark

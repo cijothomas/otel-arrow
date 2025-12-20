@@ -1,0 +1,64 @@
+name: Continuous - Idle
+components:
+  df-engine:
+    deployment:
+      docker:
+        image: df_engine:latest
+        network: testbed
+        ports:
+          - "8086:8080"
+        volumes:
+          - 'test_suites/integration/configs/engine/config.rendered.yaml:/home/dataflow/config.yaml:ro'
+        command:
+          - "--pipeline"
+          - "./config.yaml"
+          - "--core-id-range"
+          - "1-1"
+          - "--http-admin-bind"
+          - "0.0.0.0:8080"
+    monitoring:
+      docker_component:
+        allocated_cores: 1  # Matches core-id-range: 1-1
+      prometheus:
+        endpoint: http://localhost:8086/telemetry/metrics?format=prometheus&reset=false
+  backend-service:
+    deployment:
+      docker:
+        image: df_engine:latest
+        network: testbed
+        ports:
+          - "8087:8080"
+        volumes:
+          - 'test_suites/integration/configs/backend/config.rendered.yaml:/home/dataflow/config.yaml:ro'
+        command:
+          - "--pipeline"
+          - "./config.yaml"
+          - "--core-id-range"
+          - "0-0"
+          - "--http-admin-bind"
+          - "0.0.0.0:8080"
+    monitoring:
+      docker_component:
+        allocated_cores: 1  # Matches core-id-range: 0-0
+      prometheus:
+        endpoint: http://localhost:8087/telemetry/metrics?format=prometheus&reset=false
+
+tests:
+  - name: OTLP-ATTR-OTLP-IDLE
+    from_template:
+      path: test_suites/integration/templates/test_steps/df-idle-steps-docker.yaml
+      variables:
+        result_dir: "continuous_idle"
+        engine_config_template: test_suites/integration/templates/configs/engine/continuous/otlp-attr-otlp.yaml
+        backend_receiver_type: otlp
+        observation_interval: 60
+        wait_for_stabilization: 10
+  - name: OTAP-ATTR-OTLP-IDLE
+    from_template:
+      path: test_suites/integration/templates/test_steps/df-idle-steps-docker.yaml
+      variables:
+        result_dir: "continuous_idle"
+        engine_config_template: test_suites/integration/templates/configs/engine/continuous/otap-attr-otlp.yaml
+        backend_receiver_type: otlp
+        observation_interval: 60
+        wait_for_stabilization: 10

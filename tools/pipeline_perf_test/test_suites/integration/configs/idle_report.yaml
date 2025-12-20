@@ -1,0 +1,137 @@
+queries:
+  - name: Filter superfluous metadata
+    sql: |
+      CREATE VIEW metadata_filtered AS
+      SELECT *
+      FROM metadata
+      WHERE Attribute NOT LIKE 'test.ctx.%';
+
+  - name: Calculate observation window for this test
+    sql: |
+      CREATE TABLE observation_window AS WITH event_times AS (
+        SELECT
+          "attributes.test.name" AS test_name,
+          name AS event_name,
+          TO_TIMESTAMP(timestamp / 1000000000.0) AS timestamp
+        FROM events
+        WHERE name IN ('observation_start', 'observation_stop')
+      ),
+      observation_windows AS (
+        SELECT
+          start.test_name,
+          start.timestamp AS start_ts,
+          stop.timestamp AS stop_ts
+        FROM
+          event_times start
+          JOIN event_times stop ON start.test_name = stop.test_name
+        WHERE
+          start.event_name = 'observation_start'
+          AND stop.event_name = 'observation_stop'
+          AND start.timestamp < stop.timestamp
+      )
+
+      SELECT
+        w.*
+      FROM
+        metadata_row
+        JOIN observation_windows w ON metadata_row."test.name" = w.test_name
+
+  - name: Container CPU Usage
+    sql: |
+      CREATE TABLE container_cpu_usage AS WITH
+        metrics_filtered AS (
+            SELECT *,
+            "metric_attributes.component_name" AS component_name
+            FROM metrics
+            WHERE metric_name = 'container.cpu.percent'
+            AND timestamp BETWEEN (SELECT start_ts FROM observation_window)
+            AND (SELECT stop_ts FROM observation_window)
+        )
+      SELECT
+        component_name,
+        AVG(value) AS avg_cpu_percent,
+        MIN(value) AS min_cpu_percent,
+        MAX(value) AS max_cpu_percent,
+        STDDEV(value) AS stddev_cpu_percent
+      FROM metrics_filtered
+      GROUP BY component_name
+      ORDER BY component_name;
+
+  - name: Container Memory Usage
+    sql: |
+      CREATE TABLE container_memory_usage AS WITH
+        metrics_filtered AS (
+            SELECT *,
+            "metric_attributes.component_name" AS component_name
+            FROM metrics
+            WHERE metric_name = 'container.memory.usage'
+            AND timestamp BETWEEN (SELECT start_ts FROM observation_window)
+            AND (SELECT stop_ts FROM observation_window)
+        )
+      SELECT
+        component_name,
+        AVG(value) / 1024.0 / 1024.0 AS avg_memory_mb,
+        MIN(value) / 1024.0 / 1024.0 AS min_memory_mb,
+        MAX(value) / 1024.0 / 1024.0 AS max_memory_mb,
+        STDDEV(value) / 1024.0 / 1024.0 AS stddev_memory_mb
+      FROM metrics_filtered
+      GROUP BY component_name
+      ORDER BY component_name;
+
+  - name: Create Final Github Actions Format table
+    sql: |
+      CREATE TABLE gh_actions_benchmark AS
+          SELECT 'cpu_percentage_avg' AS name, '%' AS unit, avg_cpu_percent AS value,
+                metadata_row."test.suite" || '/' || metadata_row."test.name" || ' - CPU % (Idle)' AS extra
+          FROM container_cpu_usage
+          CROSS JOIN metadata_row
+          WHERE component_name = 'df-engine'
+
+          UNION ALL
+
+          SELECT 'cpu_percentage_max' AS name, '%' AS unit, max_cpu_percent AS value,
+                metadata_row."test.suite" || '/' || metadata_row."test.name" || ' - CPU % Max (Idle)' AS extra
+          FROM container_cpu_usage
+          CROSS JOIN metadata_row
+          WHERE component_name = 'df-engine'
+
+          UNION ALL
+
+          SELECT 'ram_mb_avg' AS name, 'MB' AS unit, avg_memory_mb AS value,
+                metadata_row."test.suite" || '/' || metadata_row."test.name" || ' - RAM MB (Idle)' AS extra
+          FROM container_memory_usage
+          CROSS JOIN metadata_row
+          WHERE component_name = 'df-engine'
+
+          UNION ALL
+
+          SELECT 'ram_mb_max' AS name, 'MB' AS unit, max_memory_mb AS value,
+                metadata_row."test.suite" || '/' || metadata_row."test.name" || ' - RAM MB Max (Idle)' AS extra
+          FROM container_memory_usage
+          CROSS JOIN metadata_row
+          WHERE component_name = 'df-engine'
+
+          ORDER BY extra, name;
+
+display:
+  - title: "Test Configuration"
+    table: metadata_filtered
+
+  - title: "Observation Window"
+    table: observation_window
+
+  - title: "Container CPU Usage (Idle)"
+    table: container_cpu_usage
+    description: |
+      CPU usage statistics for each component during idle observation period.
+      This shows the baseline CPU consumption with no traffic load.
+
+  - title: "Container Memory Usage (Idle)"
+    table: container_memory_usage
+    description: |
+      Memory usage statistics for each component during idle observation period.
+      This shows the baseline memory footprint with no traffic load.
+
+  - name: gh_actions_benchmark
+    description: The final metrics used with gh_actions_benchmark (idle state metrics only).
+
