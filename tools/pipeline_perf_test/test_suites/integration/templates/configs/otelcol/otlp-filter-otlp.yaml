@@ -10,15 +10,6 @@ exporters:
     tls:
       insecure: true
 
-processors:
-  filter:
-    error_mode: ignore
-    logs:
-      include:
-        match_type: strict
-        record_attributes:
-          - key: ios.app.state
-            value: active
 service:
   telemetry:
     metrics:
@@ -31,5 +22,4 @@ service:
   pipelines:
     logs:
       receivers: [otlp]
-      processors: [filter]
       exporters: [otlp]
