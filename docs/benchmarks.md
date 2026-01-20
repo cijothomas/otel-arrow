@@ -88,6 +88,11 @@ an attribute processor, pass-through mode allows the engine to forward data
 without materializing the internal representation, achieving significantly
 higher throughput.
 
+Two protocol configurations are tested:
+
+- **OTLP-OTLP**
+- **OTAP-OTAP**
+
 #### 8. Idle State
 
 **URL:** <https://open-telemetry.github.io/otel-arrow/benchmarks/continuous-idle-state/>
