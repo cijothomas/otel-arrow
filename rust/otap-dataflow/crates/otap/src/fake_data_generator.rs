@@ -157,6 +157,10 @@ impl local::Receiver<OtapPdata> for FakeGeneratorReceiver {
                             _ = metrics_reporter.report(&mut self.metrics);
                         }
                         Ok(NodeControlMsg::Shutdown {deadline, ..}) => {
+                            otel_info!(
+                                "receiver.shutdown",
+                                message = "Shutdown control message received, terminating fake data generator"
+                            );
                             return Ok(TerminalState::new(deadline, [self.metrics.snapshot()]));
                         },
                         Err(e) => {

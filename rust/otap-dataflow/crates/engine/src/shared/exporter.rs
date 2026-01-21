@@ -191,8 +191,15 @@ impl<PData> MessageChannel<PData> {
                         Ok(pdata) => {
                             return Ok(Message::PData(pdata));
                         }
-                        Err(e) => {
-                            return Err(e);
+                        Err(_) => {
+                            // pdata channel closed in normal mode.
+                            // This typically means upstream has finished and closed the channel.
+                            // Treat this as a graceful shutdown with an immediate deadline.
+                            self.shutdown();
+                            return Ok(Message::Control(NodeControlMsg::Shutdown {
+                                deadline: Instant::now(),
+                                reason: "Upstream pdata channel closed".to_owned(),
+                            }));
                         }
                     }
                 }

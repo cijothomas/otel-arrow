@@ -38,7 +38,7 @@ use otap_df_telemetry::metrics::MetricSet;
 use otap_df_telemetry::otel_info;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tonic::transport::Channel;
 use tonic::{IntoStreamingRequest, Response, Status, Streaming};
@@ -168,7 +168,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
         .then(|| arrow_ipc::CompressionType::ZSTD);
 
         // TODO check if we can expose/use spawn_local method in the effect handler
-        let logs_handle = tokio::task::spawn_local(stream_arrow_batches(
+        let mut logs_handle = tokio::task::spawn_local(stream_arrow_batches(
             arrow_logs_client,
             SignalType::Logs,
             ipc_compression,
@@ -176,7 +176,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
             pdata_metrics_tx.clone(),
             shutdown_rx.clone(),
         ));
-        let metrics_handle = tokio::task::spawn_local(stream_arrow_batches(
+        let mut metrics_handle = tokio::task::spawn_local(stream_arrow_batches(
             arrow_metrics_client,
             SignalType::Metrics,
             ipc_compression,
@@ -184,7 +184,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
             pdata_metrics_tx.clone(),
             shutdown_rx.clone(),
         ));
-        let traces_handle = tokio::task::spawn_local(stream_arrow_batches(
+        let mut traces_handle = tokio::task::spawn_local(stream_arrow_batches(
             arrow_traces_client,
             SignalType::Traces,
             ipc_compression,
@@ -208,9 +208,28 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                     // shutdown the exporter
                     Message::Control(NodeControlMsg::Shutdown { deadline, .. }) => {
                         _ = shutdown_tx.send_replace(true);
-                        _ = logs_handle.await;
-                        _ = metrics_handle.await;
-                        _ = traces_handle.await;
+                        // Drop senders to unblock receivers waiting in create_req_stream.
+                        // This causes rx.recv() to return None, allowing the streaming
+                        // tasks to terminate gracefully.
+                        drop(logs_sender);
+                        drop(metrics_sender);
+                        drop(traces_sender);
+
+                        // Calculate remaining time until deadline, with a minimum of 1 second
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let timeout_per_handle = remaining.max(Duration::from_secs(1)) / 3;
+
+                        // Await handles with timeout, abort if they don't complete in time
+                        if tokio::time::timeout(timeout_per_handle, &mut logs_handle).await.is_err() {
+                            logs_handle.abort();
+                        }
+                        if tokio::time::timeout(timeout_per_handle, &mut metrics_handle).await.is_err() {
+                            metrics_handle.abort();
+                        }
+                        if tokio::time::timeout(timeout_per_handle, &mut traces_handle).await.is_err() {
+                            traces_handle.abort();
+                        }
+
                         _ = timer_cancel_handle.cancel().await;
                         return Ok(TerminalState::new(deadline, [self.pdata_metrics]))
                     }
@@ -309,7 +328,15 @@ async fn stream_arrow_batches<T: StreamingArrowService>(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let otap_batches_rx = Arc::new(tokio::sync::Mutex::new(otap_batches_rx));
-    let mut shutdown = false;
+
+    // Mark the current value as seen so changed() will properly detect future updates.
+    // This handles the race condition where shutdown_tx.send_replace(true)
+    // was called before this task started listening.
+    shutdown_rx.mark_changed();
+    let mut shutdown = *shutdown_rx.borrow_and_update();
+    if shutdown {
+        return;
+    }
 
     // we'll do an exponential backoff if there was an error creating the streaming request
     const MAX_BACKOFF: Duration = Duration::from_secs(10);
@@ -319,7 +346,25 @@ async fn stream_arrow_batches<T: StreamingArrowService>(
 
     // send streams of batches to the server until shutdown
     while !shutdown {
-        let mut rx = otap_batches_rx.lock().await;
+        // Check shutdown before acquiring lock
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        // Acquire lock with shutdown awareness
+        let rx = tokio::select! {
+            biased;
+
+            _ = shutdown_rx.changed() => {
+                shutdown = *shutdown_rx.borrow_and_update();
+                continue;
+            }
+            guard = otap_batches_rx.lock() => {
+                guard
+            }
+        };
+        let mut rx = rx;
+
         tokio::select! {
             // wait to receive the first batch to create the streaming request
             first_batch = rx.recv() => {
@@ -333,38 +378,55 @@ async fn stream_arrow_batches<T: StreamingArrowService>(
                     }
                 };
 
+                // Check shutdown before making gRPC call
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+
                 // create the request stream
                 let req_stream = create_req_stream(
                     first_batch,
                     otap_batches_rx.clone(),
                     signal_type,
                     ipc_compression,
-                    pdata_metrics_tx.clone()
+                    pdata_metrics_tx.clone(),
+                    shutdown_rx.clone(),
                 );
-                match client.handle_req_stream(req_stream).await {
-                    Ok(res) => {
-                        // reset the reconnect timeout backoff
-                        failed_request_backoff = INITIAL_BACKOFF;
 
-                        // handle server responses until error or shutdown
-                        shutdown = handle_res_stream(
-                            res.into_inner(),
-                            pdata_metrics_tx.clone(),
-                            signal_type,
-                            shutdown_rx.clone()
-                        ).await;
+                // Wrap the gRPC call in a select to allow shutdown to interrupt it
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.changed() => {
+                        shutdown = *shutdown_rx.borrow_and_update();
                     }
-                    Err(_e) => {
-                        // there was an error initiating the streaming request
-                        _ = pdata_metrics_tx.send(PDataMetricsUpdate::IncFailed(signal_type)).await;
-                        log::error!("failed request, waiting {failed_request_backoff:?}");
-                        tokio::time::sleep(failed_request_backoff).await;
-                        failed_request_backoff = std::cmp::min(failed_request_backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF);
+                    result = client.handle_req_stream(req_stream) => {
+                        match result {
+                            Ok(res) => {
+                                // reset the reconnect timeout backoff
+                                failed_request_backoff = INITIAL_BACKOFF;
+
+                                // handle server responses until error or shutdown
+                                shutdown = handle_res_stream(
+                                    res.into_inner(),
+                                    pdata_metrics_tx.clone(),
+                                    signal_type,
+                                    shutdown_rx.clone()
+                                ).await;
+                            }
+                            Err(_e) => {
+                                // there was an error initiating the streaming request
+                                _ = pdata_metrics_tx.send(PDataMetricsUpdate::IncFailed(signal_type)).await;
+                                log::error!("failed request, waiting {failed_request_backoff:?}");
+                                tokio::time::sleep(failed_request_backoff).await;
+                                failed_request_backoff = std::cmp::min(failed_request_backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF);
+                            }
+                        }
                     }
-                };
+                }
             }
             _ = shutdown_rx.changed() => {
-                 shutdown = *shutdown_rx.borrow();
+                 shutdown = *shutdown_rx.borrow_and_update();
             }
         }
     }
@@ -377,8 +439,15 @@ fn create_req_stream(
     signal_type: SignalType,
     ipc_compression: Option<arrow_ipc::CompressionType>,
     pdata_metrics_tx: Sender<PDataMetricsUpdate>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> impl IntoStreamingRequest<Message = BatchArrowRecords> {
     stream! {
+        // Mark the current value as seen so changed() will properly detect future updates.
+        shutdown_rx.mark_changed();
+        if *shutdown_rx.borrow_and_update() {
+            return;
+        }
+
         let mut producer = Producer::new_with_options(ProducerOptions {
             ipc_compression
         });
@@ -391,13 +460,44 @@ fn create_req_stream(
             }
         };
 
-        let mut rx = remaining_batches_rx.lock().await;
-        // send the remaining batches
-        while let Some(mut otap_batch) = rx.recv().await {
-            match producer.produce_bar(&mut otap_batch) {
-                Ok(bar) => yield bar,
-                Err(_) => {
-                    _ = pdata_metrics_tx.send(PDataMetricsUpdate::IncFailed(signal_type));
+        // Acquire lock with shutdown awareness
+        let rx = tokio::select! {
+            biased;
+
+            _ = shutdown_rx.changed() => {
+                // Shutdown requested during lock acquisition
+                return;
+            }
+            guard = remaining_batches_rx.lock() => {
+                guard
+            }
+        };
+        let mut rx = rx;
+
+        // send the remaining batches using select to respond to shutdown
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = shutdown_rx.changed() => {
+                    // Shutdown requested, exit the stream
+                    break;
+                }
+                batch = rx.recv() => {
+                    match batch {
+                        Some(mut otap_batch) => {
+                            match producer.produce_bar(&mut otap_batch) {
+                                Ok(bar) => yield bar,
+                                Err(_) => {
+                                    _ = pdata_metrics_tx.send(PDataMetricsUpdate::IncFailed(signal_type));
+                                }
+                            }
+                        }
+                        None => {
+                            // Channel closed, exit the stream
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -410,11 +510,23 @@ async fn handle_res_stream(
     signal_type: SignalType,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> bool {
-    let mut shutdown = false;
+    // Mark the current value as seen so changed() will properly detect future updates.
+    // This handles the race condition where shutdown_tx.send_replace(true)
+    // was called before this function started listening.
+    shutdown_rx.mark_changed();
+    let mut shutdown = *shutdown_rx.borrow_and_update();
+    if shutdown {
+        return true;
+    }
 
     // handle streaming responses until shutdown
     while !shutdown {
         tokio::select! {
+            biased;
+
+            _ = shutdown_rx.changed() => {
+                shutdown = *shutdown_rx.borrow_and_update();
+            }
             res = res_stream.message() => {
                 match res {
                     Ok(Some(_val)) => {
@@ -429,9 +541,6 @@ async fn handle_res_stream(
                         break
                     }
                 };
-            }
-            _ = shutdown_rx.changed() => {
-                shutdown = *shutdown_rx.borrow();
             }
         }
     }
