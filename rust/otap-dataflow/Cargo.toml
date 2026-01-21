@@ -29,10 +29,26 @@ categories = ["asynchronous", "network-programming"]
 name = "df_engine"
 path = "src/main.rs"
 
+[[example]]
+name = "arrow_basics"
+path = "examples/arrow_basics.rs"
+
+[[example]]
+name = "arrow_operations"
+path = "examples/arrow_operations.rs"
+
+[[example]]
+name = "otlp_arrow_conversion"
+path = "examples/otlp_arrow_conversion.rs"
+
 [dependencies]
+arrow.workspace = true
+bytes.workspace = true
+prost.workspace = true
 otap-df-config.workspace = true
 otap-df-controller.workspace = true
 otap-df-otap.workspace = true
+otap-df-pdata.workspace = true
 thiserror.workspace = true
 quiver = { workspace = true, optional = true }
 serde_json.workspace = true
@@ -47,6 +63,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 [workspace.dependencies]
 otap-df-pdata-otlp-macros = { path = "./crates/pdata/src/otlp/macros"}
 otap-df-pdata-otlp-model = { path = "./crates/pdata/src/otlp/model"}
+otap-df-pdata = { path = "crates/pdata" }
 otap-df-config = { path = "crates/config" }
 otap-df-controller = { path = "crates/controller" }
 otap-df-otap = { path = "crates/otap" }
