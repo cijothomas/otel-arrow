@@ -33,6 +33,21 @@ groups:
                   # Listen on all interfaces in container
                   listening_addr: "0.0.0.0:4317"
 
+          # Batch processor accumulates records before forwarding to the exporter.
+          # min_size: flush when this many log records are buffered.
+          # flush_timeout: flush after this duration even if min_size not reached
+          #   (replaces the exporter's internal 3-second periodic flush).
+          # For high-volume deployments, 1000 records at ~1KB each uncompressed
+          # ≈ 1MB, which gzip-compresses well under the 1MB HTTP limit.
+          batch:
+            type: "urn:otel:processor:batch"
+            config:
+              otlp:
+                min_size: 1000
+                sizer: items
+              flush_timeout: 3s
+              format: otlp
+
           azure-monitor-exporter:
             type: "urn:microsoft:exporter:azure_monitor"
             config:
@@ -87,4 +102,6 @@ groups:
 
         connections:
           - from: otlp-receiver
+            to: batch
+          - from: batch
             to: azure-monitor-exporter

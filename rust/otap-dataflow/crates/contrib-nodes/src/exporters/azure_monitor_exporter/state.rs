@@ -1,140 +1,108 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::AHashMap as HashMap;
 use otap_df_otap::pdata::Context;
 use otap_df_pdata::OtapPayload;
 
-/// Tracks relationships between batches ⇄ messages + their data.
-/// High-perf: uses AHashMap/AHashSet (fastest hashing for u64 keys).
+/// Data retained for a single incoming pipeline message while its HTTP chunk(s)
+/// are in flight.
+pub struct PendingMessage {
+    /// Context needed to ack or nack the message.
+    pub context: Context,
+    /// Payload to return with the ack/nack.
+    pub payload: OtapPayload,
+    /// Number of gzip-compressed HTTP chunks that must complete successfully
+    /// before this message can be acked. Decremented on each successful chunk
+    /// completion; when it reaches zero the message is acked.
+    pub pending_chunks: u32,
+}
+
+/// Tracks in-flight export state for the Azure Monitor exporter.
+///
+/// With an upstream batch processor, each incoming pipeline message maps to
+/// exactly N compressed HTTP chunks (N ≥ 1). We track a simple counter per
+/// message:
+///
+/// - All N chunks succeed → `on_chunk_success` decrements to 0 → ack.
+/// - Any chunk fails → `on_chunk_failure` removes the entry → nack.
+///   Subsequent completions for the same message return `None` (no double-ack
+///   or double-nack).
 pub struct AzureMonitorExporterState {
-    /// batch_id → set of msg_ids
-    pub batch_to_msg: HashMap<u64, HashSet<u64>>,
-
-    /// msg_id → set of batch_ids
-    pub msg_to_batch: HashMap<u64, HashSet<u64>>,
-
-    /// msg_id → (context, optional payload for ack/nack)
-    pub msg_to_data: HashMap<u64, (Context, OtapPayload)>,
+    pending: HashMap<u64, PendingMessage>,
 }
 
 impl AzureMonitorExporterState {
     /// Create state with a small initial capacity that grows on demand.
     pub fn new() -> Self {
         Self {
-            batch_to_msg: HashMap::with_capacity(256),
-            msg_to_batch: HashMap::with_capacity(256),
-            msg_to_data: HashMap::with_capacity(256),
+            pending: HashMap::with_capacity(64),
         }
     }
 
-    /// Insert a message and associate it with a batch.
-    /// If the msg already exists, its data will NOT be overwritten.
-    #[inline]
-    pub fn add_batch_msg_relationship(&mut self, batch_id: u64, msg_id: u64) {
-        // Batch → Msg
-        _ = self
-            .batch_to_msg
-            .entry(batch_id)
-            .or_default()
-            .insert(msg_id);
-
-        // Msg → Batch
-        _ = self
-            .msg_to_batch
-            .entry(msg_id)
-            .or_default()
-            .insert(batch_id);
+    /// Register a new incoming message and the number of compressed chunks
+    /// that will be dispatched for it.
+    pub fn register(
+        &mut self,
+        msg_id: u64,
+        context: Context,
+        payload: OtapPayload,
+        chunk_count: u32,
+    ) {
+        let _ = self.pending.insert(
+            msg_id,
+            PendingMessage {
+                context,
+                payload,
+                pending_chunks: chunk_count,
+            },
+        );
     }
 
-    #[inline]
-    pub fn delete_msg_data_if_orphaned(&mut self, msg_id: u64) -> Option<(Context, OtapPayload)> {
-        match self.msg_to_batch.get(&msg_id) {
-            Some(batches) if !batches.is_empty() => None, // Has batches, not orphaned
-            _ => {
-                _ = self.msg_to_batch.remove(&msg_id);
-                self.msg_to_data.remove(&msg_id)
-            }
+    /// Called when one HTTP chunk for `msg_id` completes successfully.
+    ///
+    /// Decrements the pending-chunk counter. Returns `Some((context, payload))`
+    /// when the counter reaches zero (all chunks done → ready to ack).
+    /// Returns `None` if the message was already nacked (and removed) by a
+    /// previously failed chunk.
+    pub fn on_chunk_success(&mut self, msg_id: u64) -> Option<(Context, OtapPayload)> {
+        let entry = self.pending.get_mut(&msg_id)?;
+        entry.pending_chunks = entry.pending_chunks.saturating_sub(1);
+        if entry.pending_chunks == 0 {
+            let msg = self.pending.remove(&msg_id)?;
+            Some((msg.context, msg.payload))
+        } else {
+            None
         }
     }
 
-    #[inline]
-    pub fn add_msg_to_data(&mut self, msg_id: u64, context: Context, otap_payload: OtapPayload) {
-        _ = self
-            .msg_to_data
-            .entry(msg_id)
-            .or_insert((context, otap_payload));
+    /// Called when one HTTP chunk for `msg_id` fails.
+    ///
+    /// Removes the entire entry immediately and returns `Some((context, payload))`
+    /// for nacking. Returns `None` if the message was already removed (e.g. by a
+    /// previous failed chunk), preventing double-nacks.
+    pub fn on_chunk_failure(&mut self, msg_id: u64) -> Option<(Context, OtapPayload)> {
+        self.pending
+            .remove(&msg_id)
+            .map(|msg| (msg.context, msg.payload))
     }
 
-    #[inline]
-    pub fn remove_msg_to_data(&mut self, msg_id: u64) -> Option<(Context, OtapPayload)> {
-        self.msg_to_data.remove(&msg_id)
+    /// Returns the number of messages currently tracked.
+    pub fn len(&self) -> usize {
+        self.pending.len()
     }
 
-    /// Remove a batch on SUCCESS - only returns messages with no remaining batches.
-    pub fn remove_batch_success(&mut self, batch_id: u64) -> Vec<(u64, Context, OtapPayload)> {
-        let mut orphaned = Vec::new();
-
-        if let Some(msgs) = self.batch_to_msg.remove(&batch_id) {
-            for msg_id in msgs {
-                if let Some(batches) = self.msg_to_batch.get_mut(&msg_id) {
-                    _ = batches.remove(&batch_id);
-
-                    // Only return if no remaining batches
-                    if batches.is_empty() {
-                        _ = self.msg_to_batch.remove(&msg_id);
-                        if let Some((context, otap_payload)) = self.msg_to_data.remove(&msg_id) {
-                            orphaned.push((msg_id, context, otap_payload));
-                        }
-                    }
-                }
-            }
-        }
-
-        orphaned
+    /// Returns true if no messages are currently tracked.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 
-    /// Remove a batch on FAILURE - returns ALL messages in batch, removing them entirely.
-    /// Messages are removed from all their batch associations.
-    pub fn remove_batch_failure(&mut self, batch_id: u64) -> Vec<(u64, Context, OtapPayload)> {
-        let mut failed = Vec::new();
-
-        if let Some(msgs) = self.batch_to_msg.remove(&batch_id) {
-            for msg_id in msgs {
-                // Remove this message from ALL batches it belongs to
-                if let Some(other_batches) = self.msg_to_batch.remove(&msg_id) {
-                    for other_batch_id in other_batches {
-                        if other_batch_id != batch_id {
-                            if let Some(other_batch_msgs) =
-                                self.batch_to_msg.get_mut(&other_batch_id)
-                            {
-                                _ = other_batch_msgs.remove(&msg_id);
-                            }
-                        }
-                    }
-                }
-
-                // Take the message data
-                if let Some((context, otap_payload)) = self.msg_to_data.remove(&msg_id) {
-                    failed.push((msg_id, context, otap_payload));
-                }
-            }
-        }
-
-        failed
-    }
-
-    /// Drain all remaining message data (for shutdown cleanup).
-    /// Returns all messages that still have data, regardless of batch associations.
+    /// Drain all remaining messages (for shutdown cleanup).
     pub fn drain_all(&mut self) -> Vec<(u64, Context, OtapPayload)> {
-        // Clear batch relationships
-        self.batch_to_msg.clear();
-        self.msg_to_batch.clear();
-
-        // Drain and return all message data
-        self.msg_to_data
+        self.pending
             .drain()
-            .map(|(msg_id, (context, otap_payload))| (msg_id, context, otap_payload))
+            .map(|(msg_id, msg)| (msg_id, msg.context, msg.payload))
             .collect()
     }
 }
@@ -146,179 +114,200 @@ mod tests {
     use otap_df_otap::pdata::Context;
     use otap_df_pdata::otlp::OtlpProtoBytes;
 
-    /// Helper to create a test OtapPayload from bytes
     fn test_payload(data: &'static [u8]) -> OtapPayload {
         OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(Bytes::from_static(data)))
     }
 
-    /// Helper to create an empty OtapPayload
     fn empty_payload() -> OtapPayload {
         OtapPayload::empty(otap_df_config::SignalType::Logs)
     }
 
+    // ==================== Construction Tests ====================
+
     #[test]
-    fn test_new() {
+    fn test_new_is_empty() {
         let state = AzureMonitorExporterState::new();
-        assert!(state.batch_to_msg.is_empty());
-        assert!(state.msg_to_batch.is_empty());
-        assert!(state.msg_to_data.is_empty());
+        assert!(state.is_empty());
+        assert_eq!(state.len(), 0);
+    }
+
+    // ==================== register Tests ====================
+
+    #[test]
+    fn test_register_single_chunk() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"a"), 1);
+        assert_eq!(state.len(), 1);
     }
 
     #[test]
-    fn test_add_relationships_and_data() {
+    fn test_register_multiple_chunks() {
         let mut state = AzureMonitorExporterState::new();
-        let msg_id = 1;
-        let batch_id = 100;
-        let payload = test_payload(b"test");
+        state.register(1, Context::default(), test_payload(b"a"), 3);
+        assert_eq!(state.len(), 1);
+    }
 
-        state.add_batch_msg_relationship(batch_id, msg_id);
-        state.add_msg_to_data(msg_id, Context::default(), payload);
+    // ==================== on_chunk_success Tests ====================
 
-        assert!(state.batch_to_msg.contains_key(&batch_id));
-        assert!(state.batch_to_msg.get(&batch_id).unwrap().contains(&msg_id));
+    #[test]
+    fn test_single_chunk_success_acks() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"data"), 1);
 
-        assert!(state.msg_to_batch.contains_key(&msg_id));
-        assert!(state.msg_to_batch.get(&msg_id).unwrap().contains(&batch_id));
-
-        assert!(state.msg_to_data.contains_key(&msg_id));
+        let result = state.on_chunk_success(1);
+        assert!(result.is_some());
+        assert!(state.is_empty());
     }
 
     #[test]
-    fn test_delete_msg_data_if_orphaned() {
+    fn test_multi_chunk_success_acks_only_on_last() {
         let mut state = AzureMonitorExporterState::new();
-        let msg_id = 1;
+        state.register(1, Context::default(), test_payload(b"data"), 3);
 
-        // Case 1: Message has no batches (orphaned)
-        state.add_msg_to_data(msg_id, Context::default(), test_payload(b"test"));
-        let removed = state.delete_msg_data_if_orphaned(msg_id);
-        assert!(removed.is_some());
-        // Verify the payload matches
-        let (_, payload) = removed.unwrap();
-        match payload {
-            OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(bytes)) => {
-                assert_eq!(bytes.as_ref(), b"test");
-            }
-            _ => panic!("Expected OtlpBytes::ExportLogsRequest"),
-        }
-        assert!(!state.msg_to_data.contains_key(&msg_id));
+        // First two chunks: no ack yet
+        assert!(state.on_chunk_success(1).is_none());
+        assert_eq!(state.len(), 1); // still tracked
+        assert!(state.on_chunk_success(1).is_none());
+        assert_eq!(state.len(), 1);
 
-        // Case 2: Message has batches (not orphaned)
-        state.add_msg_to_data(msg_id, Context::default(), test_payload(b"test"));
-        state.add_batch_msg_relationship(100, msg_id);
-
-        let removed = state.delete_msg_data_if_orphaned(msg_id);
-        assert!(removed.is_none());
-        assert!(state.msg_to_data.contains_key(&msg_id));
+        // Third chunk: ack
+        let result = state.on_chunk_success(1);
+        assert!(result.is_some());
+        assert!(state.is_empty());
     }
 
     #[test]
-    fn test_delete_msg_data_if_orphaned_with_empty_payload() {
+    fn test_success_on_unknown_msg_returns_none() {
         let mut state = AzureMonitorExporterState::new();
-        let msg_id = 1;
-
-        // Test with empty payload
-        state.add_msg_to_data(msg_id, Context::default(), empty_payload());
-        let removed = state.delete_msg_data_if_orphaned(msg_id);
-        assert!(removed.is_some());
-        let (_, payload) = removed.unwrap();
-        match payload {
-            OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(bytes)) => {
-                assert!(bytes.is_empty());
-            }
-            _ => panic!("Expected OtlpBytes::ExportLogsRequest"),
-        }
+        assert!(state.on_chunk_success(999).is_none());
     }
 
     #[test]
-    fn test_remove_batch_success() {
+    fn test_success_after_failure_returns_none() {
         let mut state = AzureMonitorExporterState::new();
-        let msg1 = 1;
-        let msg2 = 2;
-        let batch1 = 100;
-        let batch2 = 101;
+        state.register(1, Context::default(), test_payload(b"data"), 2);
 
-        // Setup:
-        // msg1 is in batch1 only
-        // msg2 is in batch1 AND batch2
-        state.add_batch_msg_relationship(batch1, msg1);
-        state.add_msg_to_data(msg1, Context::default(), test_payload(b"msg1"));
+        // First chunk fails → message removed → nack
+        assert!(state.on_chunk_failure(1).is_some());
 
-        state.add_batch_msg_relationship(batch1, msg2);
-        state.add_batch_msg_relationship(batch2, msg2);
-        state.add_msg_to_data(msg2, Context::default(), test_payload(b"msg2"));
+        // Second chunk succeeds, but message is already gone → no double-ack
+        assert!(state.on_chunk_success(1).is_none());
+    }
 
-        // Remove batch1 success
-        let orphaned = state.remove_batch_success(batch1);
+    // ==================== on_chunk_failure Tests ====================
 
-        // msg1 should be returned (it was only in batch1)
-        assert_eq!(orphaned.len(), 1);
-        assert_eq!(orphaned[0].0, msg1);
-        assert!(!state.msg_to_data.contains_key(&msg1));
+    #[test]
+    fn test_failure_nacks_immediately() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"data"), 3);
 
-        // msg2 should NOT be returned (it is still in batch2)
-        assert!(state.msg_to_data.contains_key(&msg2));
-
-        // Verify msg2 relationships updated
-        let msg2_batches = state.msg_to_batch.get(&msg2).unwrap();
-        assert!(!msg2_batches.contains(&batch1));
-        assert!(msg2_batches.contains(&batch2));
-
-        // Remove batch2 success
-        let orphaned2 = state.remove_batch_success(batch2);
-
-        // msg2 should now be returned
-        assert_eq!(orphaned2.len(), 1);
-        assert_eq!(orphaned2[0].0, msg2);
-        assert!(!state.msg_to_data.contains_key(&msg2));
+        let result = state.on_chunk_failure(1);
+        assert!(result.is_some());
+        assert!(state.is_empty()); // removed entirely
     }
 
     #[test]
-    fn test_remove_batch_failure() {
+    fn test_failure_on_unknown_msg_returns_none() {
         let mut state = AzureMonitorExporterState::new();
-        let msg1 = 1;
-        let msg2 = 2;
-        let batch1 = 100;
-        let batch2 = 101;
-
-        // Setup:
-        // msg1 is in batch1 only
-        // msg2 is in batch1 AND batch2
-        state.add_batch_msg_relationship(batch1, msg1);
-        state.add_msg_to_data(msg1, Context::default(), test_payload(b"msg1"));
-
-        state.add_batch_msg_relationship(batch1, msg2);
-        state.add_batch_msg_relationship(batch2, msg2);
-        state.add_msg_to_data(msg2, Context::default(), test_payload(b"msg2"));
-
-        // Remove batch1 failure
-        // Should return ALL messages in batch1, even if they are in other batches
-        let failed = state.remove_batch_failure(batch1);
-
-        assert_eq!(failed.len(), 2);
-        let ids: HashSet<u64> = failed.iter().map(|(id, _, _)| *id).collect();
-        assert!(ids.contains(&msg1));
-        assert!(ids.contains(&msg2));
-
-        // Data should be gone
-        assert!(!state.msg_to_data.contains_key(&msg1));
-        assert!(!state.msg_to_data.contains_key(&msg2));
-
-        // msg2 should be removed from batch2's list as well
-        if let Some(batch2_msgs) = state.batch_to_msg.get(&batch2) {
-            assert!(!batch2_msgs.contains(&msg2));
-        }
+        assert!(state.on_chunk_failure(999).is_none());
     }
 
     #[test]
-    fn test_drain_all() {
+    fn test_double_failure_returns_none_second_time() {
         let mut state = AzureMonitorExporterState::new();
-        state.add_msg_to_data(1, Context::default(), test_payload(b"1"));
-        state.add_msg_to_data(2, Context::default(), empty_payload()); // Test with empty payload
+        state.register(1, Context::default(), test_payload(b"data"), 2);
+
+        // First failure: nack
+        assert!(state.on_chunk_failure(1).is_some());
+        // Second failure: already removed → no double-nack
+        assert!(state.on_chunk_failure(1).is_none());
+    }
+
+    #[test]
+    fn test_failure_after_partial_success_returns_nack() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"data"), 3);
+
+        // Chunk 1 succeeds (counter: 3 → 2)
+        assert!(state.on_chunk_success(1).is_none());
+
+        // Chunk 2 fails → nack entire message
+        let result = state.on_chunk_failure(1);
+        assert!(result.is_some());
+        assert!(state.is_empty());
+
+        // Chunk 3 arrives after message is gone → no double-nack
+        assert!(state.on_chunk_success(1).is_none());
+    }
+
+    // ==================== Multiple Messages Tests ====================
+
+    #[test]
+    fn test_independent_message_tracking() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"msg1"), 2);
+        state.register(2, Context::default(), test_payload(b"msg2"), 1);
+
+        // Message 2 completes first
+        assert!(state.on_chunk_success(2).is_some());
+        assert_eq!(state.len(), 1); // msg1 still pending
+
+        // Message 1 chunk 1 succeeds (counter: 2 → 1)
+        assert!(state.on_chunk_success(1).is_none());
+
+        // Message 1 chunk 2 succeeds → ack
+        assert!(state.on_chunk_success(1).is_some());
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn test_failure_of_one_does_not_affect_other() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"msg1"), 1);
+        state.register(2, Context::default(), test_payload(b"msg2"), 1);
+
+        // Message 1 fails
+        assert!(state.on_chunk_failure(1).is_some());
+        assert_eq!(state.len(), 1); // msg2 still tracked
+
+        // Message 2 succeeds independently
+        assert!(state.on_chunk_success(2).is_some());
+        assert!(state.is_empty());
+    }
+
+    // ==================== drain_all Tests ====================
+
+    #[test]
+    fn test_drain_all_empty() {
+        let mut state = AzureMonitorExporterState::new();
+        let drained = state.drain_all();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn test_drain_all_returns_all_messages() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"1"), 1);
+        state.register(2, Context::default(), empty_payload(), 2);
 
         let drained = state.drain_all();
         assert_eq!(drained.len(), 2);
-        let ids: HashSet<u64> = drained.iter().map(|(id, _, _)| *id).collect();
+
+        let ids: std::collections::HashSet<u64> = drained.iter().map(|(id, _, _)| *id).collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn test_drain_all_clears_state() {
+        let mut state = AzureMonitorExporterState::new();
+        state.register(1, Context::default(), test_payload(b"1"), 3);
+
+        let _ = state.drain_all();
+        assert!(state.is_empty());
+        // Operations after drain return None
+        assert!(state.on_chunk_success(1).is_none());
+        assert!(state.on_chunk_failure(1).is_none());
     }
 }

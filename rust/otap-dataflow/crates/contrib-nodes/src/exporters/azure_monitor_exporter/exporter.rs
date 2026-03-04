@@ -22,8 +22,7 @@ use super::auth::Auth;
 use super::client::LogsIngestionClientPool;
 use super::config::Config;
 use super::error::Error;
-use super::gzip_batcher::FinalizeResult;
-use super::gzip_batcher::{self, GzipBatcher};
+use super::gzip_batcher::compress_and_split;
 use super::heartbeat::Heartbeat;
 use super::in_flight_exports::{CompletedExport, InFlightExports};
 use super::metrics::{AzureMonitorExporterMetrics, AzureMonitorExporterMetricsRc};
@@ -38,7 +37,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 const MAX_IN_FLIGHT_EXPORTS: usize = 16;
-const PERIODIC_EXPORT_INTERVAL: u64 = 3;
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
 /// Minimum interval between token refresh attempts (10 seconds).
 const MIN_TOKEN_REFRESH_INTERVAL_SECS: u64 = 10;
@@ -51,12 +49,12 @@ const TOKEN_EXPIRY_BUFFER_SECS: u64 = 295;
 pub struct AzureMonitorExporter {
     config: Config,
     transformer: Transformer,
-    gzip_batcher: GzipBatcher,
     state: AzureMonitorExporterState,
     metrics: AzureMonitorExporterMetricsRc,
     client_pool: LogsIngestionClientPool,
     in_flight_exports: InFlightExports,
-    last_batch_queued_at: tokio::time::Instant,
+    /// Monotonic counter used to assign a unique batch_id to each HTTP chunk.
+    next_batch_id: u64,
     heartbeat: Heartbeat,
 }
 
@@ -77,33 +75,27 @@ impl AzureMonitorExporter {
         // Create log transformer
         let transformer = Transformer::new(&config, metrics.clone());
 
-        // Create Gzip batcher
-        let gzip_batcher = GzipBatcher::new();
-
         // Create heartbeat handler
         let heartbeat = Heartbeat::new(&config.api)?;
 
         Ok(Self {
             config,
             transformer,
-            gzip_batcher,
             state: AzureMonitorExporterState::new(),
             metrics: metrics.clone(),
             client_pool: LogsIngestionClientPool::new(MAX_IN_FLIGHT_EXPORTS + 1, metrics),
             in_flight_exports: InFlightExports::new(MAX_IN_FLIGHT_EXPORTS),
-            last_batch_queued_at: tokio::time::Instant::now(),
+            next_batch_id: 0,
             heartbeat,
         })
     }
 
-    /// Update all gauges (in-flight exports + state map sizes).
+    /// Update gauges (in-flight exports + pending message count).
     #[inline]
     fn sync_gauges(&self) {
         let mut m = self.metrics.borrow_mut();
         m.set_in_flight_exports(self.in_flight_exports.len() as u64);
-        m.set_batch_to_msg_count(self.state.batch_to_msg.len() as u64);
-        m.set_msg_to_batch_count(self.state.msg_to_batch.len() as u64);
-        m.set_msg_to_data_count(self.state.msg_to_data.len() as u64);
+        m.set_msg_to_data_count(self.state.len() as u64);
     }
 
     async fn finalize_export(
@@ -113,6 +105,7 @@ impl AzureMonitorExporter {
     ) -> Result<(), EngineError> {
         let CompletedExport {
             batch_id,
+            msg_id,
             client,
             result,
             row_count,
@@ -123,11 +116,11 @@ impl AzureMonitorExporter {
 
         match result {
             Ok(duration) => {
-                self.handle_export_success(effect_handler, batch_id, row_count, duration)
+                self.handle_export_success(effect_handler, batch_id, msg_id, row_count, duration)
                     .await
             }
             Err(e) => {
-                self.handle_export_failure(effect_handler, batch_id, row_count, e)
+                self.handle_export_failure(effect_handler, batch_id, msg_id, row_count, e)
                     .await
             }
         }
@@ -137,14 +130,12 @@ impl AzureMonitorExporter {
         &mut self,
         effect_handler: &EffectHandler<OtapPdata>,
         batch_id: u64,
+        msg_id: u64,
         row_count: f64,
         duration: std::time::Duration,
     ) -> Result<(), EngineError> {
-        // Export succeeded - Ack only fully-completed messages
-        let completed_messages = self.state.remove_batch_success(batch_id);
         {
             let mut m = self.metrics.borrow_mut();
-            m.add_messages(completed_messages.len() as u64);
             m.add_rows(row_count as u64);
             m.add_batch();
         }
@@ -152,15 +143,19 @@ impl AzureMonitorExporter {
         otel_debug!(
             "azure_monitor_exporter.export.success",
             batch_id = batch_id,
+            msg_id = msg_id,
             row_count = row_count,
             duration_ms = duration.as_millis() as u64
         );
 
-        for (_, context, payload) in completed_messages {
+        // Ack the source message only when all its chunks have succeeded.
+        if let Some((context, payload)) = self.state.on_chunk_success(msg_id) {
+            self.metrics.borrow_mut().add_messages(1);
             effect_handler
                 .notify_ack(AckMsg::new(OtapPdata::new(context, payload)))
                 .await?;
         }
+
         Ok(())
     }
 
@@ -168,21 +163,22 @@ impl AzureMonitorExporter {
         &mut self,
         effect_handler: &EffectHandler<OtapPdata>,
         batch_id: u64,
+        msg_id: u64,
         row_count: f64,
         error: Error,
     ) -> Result<(), EngineError> {
-        // Export failed - Nack ALL messages in this batch, remove entirely
-        let failed_messages = self.state.remove_batch_failure(batch_id);
         {
             let mut m = self.metrics.borrow_mut();
-            m.add_failed_messages(failed_messages.len() as u64);
             m.add_failed_rows(row_count as u64);
             m.add_failed_batch();
         }
 
-        otel_error!("azure_monitor_exporter.export.failed", batch_id = batch_id, error = %error);
+        otel_error!("azure_monitor_exporter.export.failed", batch_id = batch_id, msg_id = msg_id, error = %error);
 
-        for (_, context, payload) in failed_messages {
+        // Nack the source message on first failure; subsequent chunk failures
+        // for the same message return None (message already nacked).
+        if let Some((context, payload)) = self.state.on_chunk_failure(msg_id) {
+            self.metrics.borrow_mut().add_failed_messages(1);
             effect_handler
                 .notify_nack(NackMsg::new(
                     error.to_string(),
@@ -190,34 +186,6 @@ impl AzureMonitorExporter {
                 ))
                 .await?;
         }
-        Ok(())
-    }
-
-    async fn queue_pending_batch(
-        &mut self,
-        effect_handler: &EffectHandler<OtapPdata>,
-    ) -> Result<(), EngineError> {
-        let pending_batch = match self.gzip_batcher.take_pending_batch() {
-            Some(batch) => batch,
-            None => return Ok(()), // No pending batch - nothing to do
-        };
-
-        let client = self.client_pool.take();
-        if let Some(completed_export) = self
-            .in_flight_exports
-            .push_export(
-                client,
-                pending_batch.batch_id,
-                pending_batch.row_count,
-                pending_batch.compressed_data,
-            )
-            .await
-        {
-            self.finalize_export(effect_handler, completed_export)
-                .await?;
-        }
-
-        self.last_batch_queued_at = tokio::time::Instant::now();
 
         Ok(())
     }
@@ -230,75 +198,84 @@ impl AzureMonitorExporter {
         logs_view: &T,
         msg_id: u64,
     ) -> Result<(), EngineError> {
-        if context.may_return_payload() {
-            self.state.add_msg_to_data(msg_id, context, payload);
-        } else {
-            self.state
-                .add_msg_to_data(msg_id, context, OtapPayload::empty(SignalType::Logs));
-        }
+        // Phase 1: Transform OTLP/OTAP records to JSON bytes.
+        let records = self.transformer.convert_to_log_analytics(logs_view);
 
-        // Use a generic transformer method that accepts LogsDataView
-        let log_entries = self.transformer.convert_to_log_analytics(logs_view);
-
-        for log_entry in log_entries {
-            match self.gzip_batcher.push(&log_entry) {
-                Ok(gzip_batcher::PushResult::Ok(batch_id)) => {
-                    // current batch id is being associated with the current message
-                    self.state.add_batch_msg_relationship(batch_id, msg_id);
-                }
-                Ok(gzip_batcher::PushResult::BatchReady(new_batch_id)) => {
-                    // new batch id is being associated with the current message
-                    self.state.add_batch_msg_relationship(new_batch_id, msg_id);
-                    self.queue_pending_batch(effect_handler).await?;
-                }
-                Ok(gzip_batcher::PushResult::TooLarge) => {
-                    let error = Error::LogEntryTooLarge;
-                    self.metrics.borrow_mut().add_log_entry_too_large();
-                    otel_warn!(
-                        "azure_monitor_exporter.message.log_entry_too_large",
-                        msg_id = msg_id,
-                        size_bytes = log_entry.len()
-                    );
-                    if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
-                        effect_handler
-                            .notify_nack(NackMsg::new(
-                                error.to_string(),
-                                OtapPdata::new(context, payload),
-                            ))
-                            .await?;
-                    }
-                    return Err(EngineError::InternalError {
-                        message: error.to_string(),
-                    });
-                }
-                Err(error) => {
-                    otel_error!("azure_monitor_exporter.message.batch_push_failed", msg_id = msg_id, error = %error);
-                    if let Some((context, payload)) = self.state.remove_msg_to_data(msg_id) {
-                        effect_handler
-                            .notify_nack(NackMsg::new(
-                                error.to_string(),
-                                OtapPdata::new(context, payload),
-                            ))
-                            .await?;
-                    }
-                    return Err(EngineError::InternalError {
-                        message: error.to_string(),
-                    });
-                }
-            }
-        }
-
-        if let Some((context, payload)) = self.state.delete_msg_data_if_orphaned(msg_id) {
+        if records.is_empty() {
             otel_debug!(
                 "azure_monitor_exporter.message.no_valid_entries",
                 msg_id = msg_id
             );
+            let stored_payload = if context.may_return_payload() {
+                payload
+            } else {
+                OtapPayload::empty(SignalType::Logs)
+            };
             effect_handler
                 .notify_nack(NackMsg::new(
                     "No valid log entries produced",
-                    OtapPdata::new(context, payload),
+                    OtapPdata::new(context, stored_payload),
                 ))
                 .await?;
+            return Ok(());
+        }
+
+        // Phase 2: Gzip-compress and split into ≤1MB chunks.
+        let chunks = match compress_and_split(&records) {
+            Ok(chunks) => chunks,
+            Err(Error::LogEntryTooLarge) => {
+                self.metrics.borrow_mut().add_log_entry_too_large();
+                otel_warn!(
+                    "azure_monitor_exporter.message.log_entry_too_large",
+                    msg_id = msg_id
+                );
+                let stored_payload = if context.may_return_payload() {
+                    payload
+                } else {
+                    OtapPayload::empty(SignalType::Logs)
+                };
+                effect_handler
+                    .notify_nack(NackMsg::new(
+                        Error::LogEntryTooLarge.to_string(),
+                        OtapPdata::new(context, stored_payload),
+                    ))
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                otel_error!(
+                    "azure_monitor_exporter.message.compress_failed",
+                    msg_id = msg_id,
+                    error = %e
+                );
+                return Err(EngineError::InternalError {
+                    message: e.to_string(),
+                });
+            }
+        };
+
+        // Phase 3: Register the message and dispatch all chunks as HTTP sends.
+        let chunk_count = chunks.len() as u32;
+        let stored_payload = if context.may_return_payload() {
+            payload
+        } else {
+            OtapPayload::empty(SignalType::Logs)
+        };
+        self.state
+            .register(msg_id, context, stored_payload, chunk_count);
+
+        for chunk in chunks {
+            self.next_batch_id += 1;
+            let batch_id = self.next_batch_id;
+            let client = self.client_pool.take();
+            if let Some(completed_export) = self
+                .in_flight_exports
+                .push_export(client, batch_id, msg_id, chunk.row_count, chunk.compressed_data)
+                .await
+            {
+                self.finalize_export(effect_handler, completed_export)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -316,26 +293,11 @@ impl AzureMonitorExporter {
         Ok(())
     }
 
-    async fn queue_current_batch(
-        &mut self,
-        effect_handler: &EffectHandler<OtapPdata>,
-    ) -> Result<(), EngineError> {
-        match self.gzip_batcher.finalize() {
-            Ok(FinalizeResult::Ok) => {
-                return self.queue_pending_batch(effect_handler).await;
-            }
-            Ok(FinalizeResult::Empty) => Ok(()),
-            Err(error) => Err(EngineError::InternalError {
-                message: error.to_string(),
-            }),
-        }
-    }
-
     async fn handle_shutdown(
         &mut self,
         effect_handler: &EffectHandler<OtapPdata>,
     ) -> Result<(), EngineError> {
-        self.queue_current_batch(effect_handler).await?;
+        // No in-batcher accumulation to flush — just drain the in-flight HTTP requests.
         self.drain_in_flight_exports(effect_handler).await?;
 
         for (msg_id, context, payload) in self.state.drain_all() {
@@ -498,14 +460,9 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
             })?;
 
         let mut next_token_refresh = tokio::time::Instant::now();
-        let mut next_periodic_export = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(PERIODIC_EXPORT_INTERVAL);
         let mut next_heartbeat_send = tokio::time::Instant::now();
 
         loop {
-            // Determine if we should accept new messages
-            let at_capacity = self.in_flight_exports.len() >= MAX_IN_FLIGHT_EXPORTS;
-
             tokio::select! {
                 biased;
 
@@ -556,15 +513,6 @@ impl Exporter<OtapPdata> for AzureMonitorExporter {
                 completed = self.in_flight_exports.next_completion() => {
                     if let Some(completed_export) = completed {
                         self.finalize_export(&effect_handler, completed_export).await?;
-                    }
-                }
-
-                _ = tokio::time::sleep_until(next_periodic_export), if !at_capacity => {
-                    next_periodic_export = tokio::time::Instant::now() + tokio::time::Duration::from_secs(PERIODIC_EXPORT_INTERVAL);
-
-                    if self.last_batch_queued_at.elapsed() >= std::time::Duration::from_secs(PERIODIC_EXPORT_INTERVAL) && self.gzip_batcher.has_pending_data() {
-                        otel_debug!("azure_monitor_exporter.export.periodic_flush");
-                        self.queue_current_batch(&effect_handler).await?;
                     }
                 }
 
@@ -630,6 +578,7 @@ mod tests {
     use otap_df_engine::local::exporter::EffectHandler;
     use otap_df_engine::node::NodeId;
     use otap_df_otap::pdata::Context;
+    use otap_df_pdata::otlp::OtlpProtoBytes;
     use otap_df_telemetry::registry::TelemetryRegistryHandle;
     use otap_df_telemetry::reporter::MetricsReporter;
     use std::collections::HashMap;
@@ -689,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_export_success() {
+    async fn test_handle_export_success_single_chunk() {
         let config = create_test_config();
         let pipeline_ctx = create_test_pipeline_ctx();
         let mut exporter = AzureMonitorExporter::new(pipeline_ctx, config).unwrap();
@@ -707,16 +656,17 @@ mod tests {
         let payload =
             OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(Bytes::from("test")));
 
+        // Register message with 1 chunk
         exporter
             .state
-            .add_msg_to_data(msg_id, context.clone(), payload);
-        exporter.state.add_batch_msg_relationship(batch_id, msg_id);
+            .register(msg_id, context, payload, 1);
 
-        // This might fail due to missing sender in effect_handler, but state should be updated
+        // Chunk succeeds → message acked
         let _ = exporter
             .handle_export_success(
                 &effect_handler,
                 batch_id,
+                msg_id,
                 10.0,
                 std::time::Duration::from_secs(1),
             )
@@ -730,8 +680,57 @@ mod tests {
         drop(m);
 
         // Verify state cleared
-        assert!(exporter.state.batch_to_msg.is_empty());
-        assert!(exporter.state.msg_to_data.is_empty());
+        assert!(exporter.state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_export_success_multi_chunk_acks_on_last() {
+        let config = create_test_config();
+        let pipeline_ctx = create_test_pipeline_ctx();
+        let mut exporter = AzureMonitorExporter::new(pipeline_ctx, config).unwrap();
+
+        let (_, reporter) = MetricsReporter::create_new_and_receiver(10);
+        let node_id = NodeId {
+            index: 0,
+            name: "test_exporter".to_string().into(),
+        };
+        let effect_handler = EffectHandler::new(node_id, reporter);
+
+        let msg_id = 100;
+        let context = Context::default();
+        let payload =
+            OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(Bytes::from("test")));
+
+        // Register message with 2 chunks
+        exporter.state.register(msg_id, context, payload, 2);
+
+        // First chunk: no ack yet (counter: 2 → 1)
+        let _ = exporter
+            .handle_export_success(
+                &effect_handler,
+                1,
+                msg_id,
+                5.0,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+
+        assert_eq!(exporter.metrics.borrow().successful_msg_count(), 0);
+        assert!(!exporter.state.is_empty()); // still pending
+
+        // Second chunk: ack (counter: 1 → 0)
+        let _ = exporter
+            .handle_export_success(
+                &effect_handler,
+                2,
+                msg_id,
+                5.0,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+
+        assert_eq!(exporter.metrics.borrow().successful_msg_count(), 1);
+        assert!(exporter.state.is_empty());
     }
 
     #[tokio::test]
@@ -753,10 +752,7 @@ mod tests {
         let payload =
             OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(Bytes::from("test")));
 
-        exporter
-            .state
-            .add_msg_to_data(msg_id, context.clone(), payload);
-        exporter.state.add_batch_msg_relationship(batch_id, msg_id);
+        exporter.state.register(msg_id, context, payload, 1);
 
         let error = Error::ServerError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -765,7 +761,7 @@ mod tests {
         };
 
         let _ = exporter
-            .handle_export_failure(&effect_handler, batch_id, 10.0, error)
+            .handle_export_failure(&effect_handler, batch_id, msg_id, 10.0, error)
             .await;
 
         // Verify stats
@@ -776,7 +772,46 @@ mod tests {
         drop(m);
 
         // Verify state cleared
-        assert!(exporter.state.batch_to_msg.is_empty());
-        assert!(exporter.state.msg_to_data.is_empty());
+        assert!(exporter.state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_export_failure_no_double_nack() {
+        let config = create_test_config();
+        let pipeline_ctx = create_test_pipeline_ctx();
+        let mut exporter = AzureMonitorExporter::new(pipeline_ctx, config).unwrap();
+
+        let (_, reporter) = MetricsReporter::create_new_and_receiver(10);
+        let node_id = NodeId {
+            index: 0,
+            name: "test_exporter".to_string().into(),
+        };
+        let effect_handler = EffectHandler::new(node_id, reporter);
+
+        let msg_id = 100;
+        let context = Context::default();
+        let payload =
+            OtapPayload::OtlpBytes(OtlpProtoBytes::ExportLogsRequest(Bytes::from("test")));
+
+        exporter.state.register(msg_id, context, payload, 2);
+
+        let make_error = || Error::ServerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "Simulated error".to_string(),
+            retry_after: None,
+        };
+
+        // First failure: nacks the message (1 failed_msg)
+        let _ = exporter
+            .handle_export_failure(&effect_handler, 1, msg_id, 5.0, make_error())
+            .await;
+        assert_eq!(exporter.metrics.borrow().failed_msg_count(), 1);
+
+        // Second failure: message already gone → no double-nack
+        let _ = exporter
+            .handle_export_failure(&effect_handler, 2, msg_id, 5.0, make_error())
+            .await;
+        // failed_msg_count stays at 1
+        assert_eq!(exporter.metrics.borrow().failed_msg_count(), 1);
     }
 }
