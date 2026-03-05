@@ -252,7 +252,19 @@ fn validate_engine_components(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {e}");
+        let mut source = e.source();
+        while let Some(cause) = source {
+            eprintln!("  Caused by: {cause}");
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize rustls crypto provider (required for rustls 0.23+)
     // We use ring as the default provider
     #[cfg(feature = "experimental-tls")]
