@@ -83,7 +83,6 @@ efficiency gains inherent to Arrow's columnar format at larger batch sizes.
 <!-- TODO: We need to add BatchingProcessor to tests. -->
 <!-- TODO: Batch size influence might be most relevant when we
  do aggregation/transform etc. -->
-<!-- TODO: Add benchmark tests for batch sizes 10 and 100. -->
 
 ##### Standard Load - OTAP -> OTAP (Native Protocol)
 
@@ -102,11 +101,15 @@ native protocol end-to-end, eliminating protocol conversion overhead.
 
 | Batch Size | CPU Usage | Memory Usage | Network In | Network Out |
 |------------|-----------|--------------|------------|-------------|
-| 10/batch | TBD | TBD | TBD | TBD |
-| 100/batch | TBD | TBD | TBD | TBD |
+| 10/batch | 100%* | 60 MB | 3.9 MB/s | 4.1 MB/s |
+| 100/batch | 91% | 67 MB | 4.4 MB/s | 4.5 MB/s |
 | 1000/batch | 43% | 52 MB | 2.1 MB/s | 2.2 MB/s |
 | 5000/batch | 40% | 79 MB | 1.9 MB/s | 2.0 MB/s |
 | 10000/batch | 40% | 80 MB | 1.8 MB/s | 1.9 MB/s |
+
+*\*At batch size 10, the single core saturates at 100% CPU and only achieves
+~33K logs/sec — well below the 100K target. This demonstrates the per-request
+overhead dominance at very small batch sizes.*
 
 This scenario processes OTLP end-to-end using the standard OpenTelemetry
 protocol, providing a baseline for comparison with traditional OTLP-based
@@ -229,38 +232,68 @@ across different serialization formats.
 **Test Parameters:**
 
 - Input protocol: Syslog RFC 3164 (UDP)
-- Input load: 100,000 messages/second
+- Input load: 5,000 messages/second
+- Syslog message size: ~200 bytes (non-CEF) / ~200 bytes (CEF)
 - Output protocols: OTLP and OTAP
 - Test duration: 60 seconds
 
-#### Standard Load (100K Syslog Messages/sec) - OTLP Output
+<!-- TODO: Increase syslog load to 100K messages/sec to match the standard load
+     section. Current test config uses target_rate=5000. -->
+
+#### Syslog (5K Messages/sec) - OTLP Output
 
 | Metric | OTel Collector | OTel Arrow | Improvement |
 |--------|---------------|------------|-------------|
-| CPU Usage | TBD | TBD | TBD |
-| Memory Usage | TBD | TBD | TBD |
-| Network Egress | TBD | TBD | TBD |
-| Throughput (messages/sec) | TBD | TBD | TBD |
+| CPU Usage | TBD | 9% | TBD |
+| Memory Usage | TBD | 47 MB | TBD |
+| Network Egress | TBD | 89 KB/s | TBD |
+| Throughput (messages/sec) | TBD | ~5,420 (0% drop) | TBD |
 
-#### Standard Load (100K Syslog Messages/sec) - OTAP Output
+#### Syslog (5K Messages/sec) - OTAP Output
 
 | Metric | OTel Collector | OTel Arrow | Improvement |
 |--------|---------------|------------|-------------|
-| CPU Usage | TBD | TBD | TBD |
-| Memory Usage | TBD | TBD | TBD |
-| Network Egress | TBD | TBD | TBD |
-| Throughput (messages/sec) | TBD | TBD | TBD |
+| CPU Usage | TBD | 12% | TBD |
+| Memory Usage | TBD | 46 MB | TBD |
+| Network Egress | TBD | 58 KB/s | TBD |
+| Throughput (messages/sec) | TBD | ~5,418 (0% drop) | TBD |
+
+*Note: OTAP output achieves lower network egress (58 KB/s vs 89 KB/s) due to
+Arrow's columnar compression, while CPU usage is slightly higher (12% vs 9%)
+due to Arrow encoding overhead at this low throughput.*
+
+#### Syslog CEF Parsing - OTLP Output
+
+| Metric | OTel Arrow (non-CEF) | OTel Arrow (CEF) |
+|--------|---------------------|------------------|
+| CPU Usage | 9% | 13% |
+| Memory Usage | 47 MB | 47 MB |
+| Network Egress | 89 KB/s | 128 KB/s |
+| Throughput | ~5,420 logs/sec | ~5,420 logs/sec |
+
+*CEF parsing adds ~4% CPU overhead due to structured field extraction, with
+larger egress (128 KB/s vs 89 KB/s) reflecting the additional parsed fields.*
 
 ### Key Findings
 
-To be populated with analysis once benchmark data is available.
+**OTel Arrow (Syslog ingestion, single core):**
 
-The comparative analysis will demonstrate:
+- At 5K syslog messages/sec, the engine uses only 9-13% CPU on a single core,
+  leaving substantial headroom for higher loads
+- OTAP output reduces network egress by ~35% compared to OTLP output (58 KB/s
+  vs 89 KB/s) due to Arrow's columnar compression
+- CEF parsing adds ~4% CPU overhead but zero impact on throughput at this load
+  level
+- Memory footprint remains constant at ~46-47 MB regardless of output protocol
 
+**Pending:**
+
+- OTel Collector (Go) comparative numbers — requires new test configuration
+  pairing the Go collector with syslog input
+- Higher syslog load tests (100K messages/sec) to stress both systems
 - Relative efficiency of Arrow-based columnar processing vs traditional
   row-oriented data structures
 - Memory allocation patterns and garbage collection impact (Rust vs Go)
-- Throughput characteristics under varying load conditions
 
 ---
 
