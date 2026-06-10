@@ -192,7 +192,12 @@ async function findOpenIssue() {
 function bodyFingerprints(body) {
   const m = (body || "").match(/<!-- fingerprints:([^>]*)-->/);
   if (!m) return new Set();
-  return new Set(m[1].split(","));
+  return new Set(
+    m[1]
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
 }
 
 async function getRecentFingerprints(issueNumber) {
