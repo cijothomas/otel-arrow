@@ -29,6 +29,7 @@ const {
   DRY_RUN = "false",
   WORKFLOW_RUN_URL = "",
   CONFIG_JSON = "{}",
+  PATH_FILTER = "",
 } = process.env;
 
 const LABEL = "perf-regression";
@@ -235,9 +236,10 @@ async function main() {
       (p) =>
         p.startsWith("docs/benchmarks/") &&
         p.endsWith("/data.js") &&
-        !config.ignored.has(p),
+        !config.ignored.has(p) &&
+        (!PATH_FILTER || p.includes(PATH_FILTER)),
     );
-  console.log(`Discovered ${dataPaths.length} data.js files on ${BENCHMARKS_REPO}@${BENCHMARKS_BRANCH}`);
+  console.log(`Discovered ${dataPaths.length} data.js files on ${BENCHMARKS_REPO}@${BENCHMARKS_BRANCH}${PATH_FILTER ? ` (filter: "${PATH_FILTER}")` : ""}`);
 
   // 2. Fetch + diff each.
   const allFindings = [];

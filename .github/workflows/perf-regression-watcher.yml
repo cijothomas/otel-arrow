@@ -29,6 +29,10 @@ on:
         description: "Branch holding the data.js files."
         type: string
         default: "benchmarks"
+      path_filter:
+        description: "Only process data.js paths containing this substring (e.g. 'syslog'). Empty = all."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -64,6 +68,7 @@ jobs:
           BENCHMARKS_BRANCH: ${{ inputs.benchmarks_branch || 'benchmarks' }}
           DEFAULT_THRESHOLD_PCT: ${{ inputs.default_threshold_pct || '10' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          PATH_FILTER: ${{ inputs.path_filter || '' }}
           WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           CONFIG_JSON="$(cat ${{ steps.cfg.outputs.config_path }})" \
