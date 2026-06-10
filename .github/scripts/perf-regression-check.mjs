@@ -150,6 +150,12 @@ function diffEntries(path, data) {
   return findings;
 }
 
+// "docs/benchmarks/nightly/syslog-tcp/data.js" -> "nightly/syslog-tcp"
+// "docs/benchmarks/binary-size/data.js"        -> "binary-size"
+function shortName(path) {
+  return path.replace(/^docs\/benchmarks\//, "").replace(/\/data\.js$/, "");
+}
+
 function renderBody(findings) {
   const lines = [];
   lines.push(
@@ -165,13 +171,14 @@ function renderBody(findings) {
     `Dashboards: https://${BENCHMARKS_REPO.split("/")[0]}.github.io/${BENCHMARKS_REPO.split("/")[1]}/benchmarks/`,
   );
   lines.push("");
-  lines.push("| | Metric | Previous | Current | Δ | Threshold | Path |");
+  lines.push("| | Benchmark | Metric | Previous | Current | Δ | Threshold |");
   lines.push("|---|---|---|---|---|---|---|");
   for (const f of findings) {
     const unit = f.unit ? ` ${f.unit}` : "";
     const delta = `${f.deltaPct >= 0 ? "+" : ""}${f.deltaPct.toFixed(2)}%`;
+    const benchUrl = `https://github.com/${BENCHMARKS_REPO}/blob/${BENCHMARKS_BRANCH}/${f.path}`;
     lines.push(
-      `| ${f.arrow} | \`${f.metric}\` | ${f.prevValue}${unit} | ${f.currValue}${unit} | ${delta} | ±${f.threshold}% | ${f.path} |`,
+      `| ${f.arrow} | [\`${shortName(f.path)}\`](${benchUrl}) | \`${f.metric}\` | ${f.prevValue}${unit} | ${f.currValue}${unit} | ${delta} | ±${f.threshold}% |`,
     );
   }
   lines.push("");
