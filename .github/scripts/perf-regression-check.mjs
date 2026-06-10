@@ -49,10 +49,16 @@ const config = (() => {
       defaultThreshold: Number(c.default_threshold_pct ?? DEFAULT_THRESHOLD),
       overrides: c.metric_overrides ?? [],
       ignored: new Set(c.ignored_paths ?? []),
+      monitor: new Set(c.monitor ?? []),
     };
   } catch (e) {
     console.warn(`Config parse failed (${e.message}); using defaults.`);
-    return { defaultThreshold: DEFAULT_THRESHOLD, overrides: [], ignored: new Set() };
+    return {
+      defaultThreshold: DEFAULT_THRESHOLD,
+      overrides: [],
+      ignored: new Set(),
+      monitor: new Set(),
+    };
   }
 })();
 
@@ -330,9 +336,16 @@ async function main() {
         p.startsWith("docs/benchmarks/") &&
         p.endsWith("/data.js") &&
         !config.ignored.has(p) &&
+        // monitor allowlist (when non-empty) and ad-hoc PATH_FILTER both apply.
+        (config.monitor.size === 0 || config.monitor.has(p)) &&
         (!PATH_FILTER || p.includes(PATH_FILTER)),
     );
-  console.log(`Discovered ${dataPaths.length} data.js files on ${BENCHMARKS_REPO}@${BENCHMARKS_BRANCH}${PATH_FILTER ? ` (filter: "${PATH_FILTER}")` : ""}`);
+  const scopeNotes = [];
+  if (config.monitor.size > 0) scopeNotes.push(`monitor allowlist: ${config.monitor.size}`);
+  if (PATH_FILTER) scopeNotes.push(`filter: "${PATH_FILTER}"`);
+  console.log(
+    `Discovered ${dataPaths.length} data.js files on ${BENCHMARKS_REPO}@${BENCHMARKS_BRANCH}${scopeNotes.length ? ` (${scopeNotes.join("; ")})` : ""}`,
+  );
 
   // 2. Fetch + diff each.
   const allFindings = [];

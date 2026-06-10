@@ -7,6 +7,14 @@
 # A benchmark is flagged when |current - previous| / previous * 100 >= threshold.
 default_threshold_pct: 10
 
+# Allowlist of benchmarks the scheduled watcher monitors. Empty/missing = all
+# discovered data.js files. Use this to keep the signal high while flaky
+# benchmarks (e.g. scaling-efficiency, idle-*) are stabilized; expand as
+# benchmarks earn maintainer trust.
+monitor:
+  - docs/benchmarks/nightly/syslog/data.js      # syslog UDP
+  - docs/benchmarks/nightly/syslog-tcp/data.js  # syslog TCP
+
 # Per-benchmark overrides. The `path` must match a data.js file under
 # docs/benchmarks/ on the benchmarks branch. Optional `metrics:` list scopes
 # the override to specific bench names within that file; if omitted, the
