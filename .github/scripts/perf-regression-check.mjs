@@ -108,6 +108,15 @@ function diffEntries(path, data) {
     const curr = runs[runs.length - 1];
     const prev = runs[runs.length - 2];
 
+    // Skip when the two compared runs are on the same commit — any delta is
+    // pure run-to-run variance, not a regression we can attribute to a change.
+    if (prev.commit?.id && curr.commit?.id && prev.commit.id === curr.commit.id) {
+      console.log(
+        `  ${path}: skipped (latest two runs on same commit ${curr.commit.id.slice(0, 7)})`,
+      );
+      continue;
+    }
+
     // The github-action-benchmark schema allows duplicate bench names within a
     // single run; some publishers (e.g. continuous-idle-state) emit the same
     // metric name multiple times. Collapse to first-occurrence on both sides so
@@ -234,17 +243,6 @@ function renderBody(findings, commitRanges = new Map()) {
     for (const { prev, curr, benchmarks } of pairs.values()) {
       const compareUrl = `https://github.com/${BENCHMARKS_REPO}/compare/${prev}...${curr}`;
       const benchList = [...benchmarks].sort().join(", ");
-      if (prev === curr) {
-        lines.push(
-          `**\`${prev.slice(0, 7)}\` (same commit, run-to-run variance)** (${benchList})`,
-        );
-        lines.push("");
-        lines.push(
-          `_Both compared runs were on the same commit — these deltas reflect environmental variance, not code changes._`,
-        );
-        lines.push("");
-        continue;
-      }
       lines.push(`**\`${prev.slice(0, 7)}\` → [\`${curr.slice(0, 7)}\`](${compareUrl})** (${benchList})`);
       lines.push("");
       const commits = commitRanges.get(`${prev}..${curr}`);
