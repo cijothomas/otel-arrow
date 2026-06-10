@@ -123,25 +123,36 @@ function diffEntries(path, data) {
       continue;
     }
 
-    // The github-action-benchmark schema allows duplicate bench names within a
-    // single run; some publishers (e.g. continuous-idle-state) emit the same
-    // metric name multiple times. Collapse to first-occurrence on both sides so
-    // we don't emit N duplicate findings for the same name.
-    const firstByName = (benches) => {
+    // github-action-benchmark publishes one bench row per (scenario, metric)
+    // but the `name` field is just the metric — scenario lives in `extra` as
+    // "<Suite header>/<SCENARIO-ID> - <label>". Without disambiguating by
+    // scenario, a single file like syslog-tcp (4 scenarios × 11 metrics) would
+    // collapse to 11 series and "first occurrence" picks whichever scenario the
+    // publisher happens to emit first — masking real per-scenario regressions.
+    // Key everything by `${scenario}::${name}`. When `extra` is missing or
+    // unparseable, scenario is '' and behavior matches the old single-series
+    // collapse for that file.
+    const keyOf = (b) => `${scenarioOf(b.extra)}::${b.name}`;
+    const firstByKey = (benches) => {
       const out = {};
-      for (const b of benches) if (!(b.name in out)) out[b.name] = b;
-      return out;
+      let dupes = 0;
+      for (const b of benches) {
+        const k = keyOf(b);
+        if (k in out) dupes++;
+        else out[k] = b;
+      }
+      return { map: out, dupes };
     };
-    const currByName = firstByName(curr.benches);
-    const prevByName = firstByName(prev.benches);
-    if (Object.keys(currByName).length !== curr.benches.length) {
+    const { map: currByKey, dupes: currDupes } = firstByKey(curr.benches);
+    const { map: prevByKey } = firstByKey(prev.benches);
+    if (currDupes > 0) {
       console.warn(
-        `  ${path}: ${curr.benches.length - Object.keys(currByName).length} duplicate bench name(s) in latest run; using first occurrence`,
+        `  ${path}: ${currDupes} duplicate (scenario,metric) pair(s) in latest run; using first occurrence`,
       );
     }
 
-    for (const c of Object.values(currByName)) {
-      const p = prevByName[c.name];
+    for (const [k, c] of Object.entries(currByKey)) {
+      const p = prevByKey[k];
       if (!p || p.value === 0) continue;
       const deltaPct = ((c.value - p.value) / p.value) * 100;
       const th = thresholdFor(path, c.name);
@@ -149,6 +160,7 @@ function diffEntries(path, data) {
       findings.push({
         path,
         suite,
+        scenario: scenarioOf(c.extra),
         metric: c.name,
         unit: c.unit || "",
         prevValue: p.value,
@@ -169,6 +181,20 @@ function diffEntries(path, data) {
 // "docs/benchmarks/binary-size/data.js"        -> "binary-size"
 function shortName(path) {
   return path.replace(/^docs\/benchmarks\//, "").replace(/\/data\.js$/, "");
+}
+
+// github-action-benchmark stores per-row metadata in `extra` with the shape:
+//   "<Suite header>/<SCENARIO-ID> - <metric label>"
+// e.g. "Nightly - Syslog TCP/SYSLOG-TCP-3164-ATTR-OTLP - Log Throughput".
+// We use the SCENARIO-ID to disambiguate sub-scenarios that share the same
+// metric `name`. Returns '' when extra is missing or doesn't match the shape.
+function scenarioOf(extra) {
+  if (!extra || typeof extra !== "string") return "";
+  const slash = extra.indexOf("/");
+  if (slash < 0) return "";
+  const tail = extra.slice(slash + 1);
+  const dash = tail.lastIndexOf(" - ");
+  return (dash < 0 ? tail : tail.slice(0, dash)).trim();
 }
 
 async function fetchCommitRange(prev, curr) {
@@ -217,14 +243,15 @@ function renderBody(findings, commitRanges = new Map()) {
     `Dashboards: https://${BENCHMARKS_REPO.split("/")[0]}.github.io/${BENCHMARKS_REPO.split("/")[1]}/benchmarks/`,
   );
   lines.push("");
-  lines.push("| | Benchmark | Metric | Previous | Current | Δ | Threshold |");
-  lines.push("|---|---|---|---|---|---|---|");
+  lines.push("| | Benchmark | Scenario | Metric | Previous | Current | Δ | Threshold |");
+  lines.push("|---|---|---|---|---|---|---|---|");
   for (const f of findings) {
     const unit = f.unit ? ` ${f.unit}` : "";
     const delta = `${f.deltaPct >= 0 ? "+" : ""}${f.deltaPct.toFixed(2)}%`;
     const benchUrl = `https://github.com/${BENCHMARKS_REPO}/blob/${BENCHMARKS_BRANCH}/${f.path}`;
+    const scen = f.scenario ? `\`${f.scenario}\`` : "—";
     lines.push(
-      `| ${f.arrow} | [\`${shortName(f.path)}\`](${benchUrl}) | \`${f.metric}\` | ${f.prevValue}${unit} | ${f.currValue}${unit} | ${delta} | ±${f.threshold}% |`,
+      `| ${f.arrow} | [\`${shortName(f.path)}\`](${benchUrl}) | ${scen} | \`${f.metric}\` | ${f.prevValue}${unit} | ${f.currValue}${unit} | ${delta} | ±${f.threshold}% |`,
     );
   }
   lines.push("");
@@ -270,7 +297,7 @@ function renderBody(findings, commitRanges = new Map()) {
   }
 
   const fingerprints = findings
-    .map((f) => `${f.path}::${f.metric}::${f.currCommit ?? "?"}`)
+    .map((f) => `${f.path}::${f.scenario || ""}::${f.metric}::${f.currCommit ?? "?"}`)
     .sort();
   lines.push(`<!-- fingerprints:${fingerprints.join(",")} -->`);
   return lines.join("\n");
