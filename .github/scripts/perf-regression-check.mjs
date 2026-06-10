@@ -156,7 +156,38 @@ function shortName(path) {
   return path.replace(/^docs\/benchmarks\//, "").replace(/\/data\.js$/, "");
 }
 
-function renderBody(findings) {
+async function fetchCommitRange(prev, curr) {
+  // Returns array of {sha, title, url} for commits in (prev, curr].
+  try {
+    const cmp = await ghApi(
+      `/repos/${BENCHMARKS_REPO}/compare/${prev}...${curr}`,
+    );
+    return (cmp.commits || []).map((c) => ({
+      sha: c.sha,
+      title: (c.commit?.message || "").split("\n")[0],
+      url: c.html_url,
+    }));
+  } catch (err) {
+    console.warn(`  compare ${prev.slice(0, 7)}..${curr.slice(0, 7)} failed: ${err.message}`);
+    return null;
+  }
+}
+
+async function buildCommitRanges(findings) {
+  const ranges = new Map();
+  const pairs = new Set();
+  for (const f of findings) {
+    if (f.prevCommit && f.currCommit) pairs.add(`${f.prevCommit}..${f.currCommit}`);
+  }
+  for (const key of pairs) {
+    const [prev, curr] = key.split("..");
+    if (prev === curr) continue; // same commit, no range to fetch
+    ranges.set(key, await fetchCommitRange(prev, curr));
+  }
+  return ranges;
+}
+
+function renderBody(findings, commitRanges = new Map()) {
   const lines = [];
   lines.push(
     `<!-- watcher:auto-generated. Do not edit the table headers; the watcher uses them to dedup. -->`,
@@ -182,6 +213,58 @@ function renderBody(findings) {
     );
   }
   lines.push("");
+
+  // Per-pair commit ranges. A pair appears once even if many benchmarks share it.
+  const pairs = new Map();
+  for (const f of findings) {
+    if (!f.prevCommit || !f.currCommit) continue;
+    const key = `${f.prevCommit}..${f.currCommit}`;
+    if (!pairs.has(key)) {
+      pairs.set(key, {
+        prev: f.prevCommit,
+        curr: f.currCommit,
+        benchmarks: new Set(),
+      });
+    }
+    pairs.get(key).benchmarks.add(shortName(f.path));
+  }
+  if (pairs.size > 0) {
+    lines.push("### Commits in compared range");
+    lines.push("");
+    for (const { prev, curr, benchmarks } of pairs.values()) {
+      const compareUrl = `https://github.com/${BENCHMARKS_REPO}/compare/${prev}...${curr}`;
+      const benchList = [...benchmarks].sort().join(", ");
+      if (prev === curr) {
+        lines.push(
+          `**\`${prev.slice(0, 7)}\` (same commit, run-to-run variance)** (${benchList})`,
+        );
+        lines.push("");
+        lines.push(
+          `_Both compared runs were on the same commit — these deltas reflect environmental variance, not code changes._`,
+        );
+        lines.push("");
+        continue;
+      }
+      lines.push(`**\`${prev.slice(0, 7)}\` → [\`${curr.slice(0, 7)}\`](${compareUrl})** (${benchList})`);
+      lines.push("");
+      const commits = commitRanges.get(`${prev}..${curr}`);
+      if (commits === null) {
+        lines.push(`_Failed to fetch commit range._`);
+      } else if (!commits || commits.length === 0) {
+        lines.push(`_No commits in range._`);
+      } else {
+        const cap = 25;
+        for (const c of commits.slice(0, cap)) {
+          lines.push(`- [\`${c.sha.slice(0, 7)}\`](${c.url}) ${c.title}`);
+        }
+        if (commits.length > cap) {
+          lines.push(`- _… and ${commits.length - cap} more (see [compare](${compareUrl}))_`);
+        }
+      }
+      lines.push("");
+    }
+  }
+
   const fingerprints = findings
     .map((f) => `${f.path}::${f.metric}::${f.currCommit ?? "?"}`)
     .sort();
@@ -275,7 +358,8 @@ async function main() {
   }
 
   console.log(`\nTotal findings: ${allFindings.length}`);
-  const body = renderBody(allFindings);
+  const commitRanges = await buildCommitRanges(allFindings);
+  const body = renderBody(allFindings, commitRanges);
   console.log("\n--- Proposed issue body ---");
   console.log(body);
   console.log("--- End body ---\n");
@@ -304,9 +388,10 @@ async function main() {
     const novelFindings = allFindings.filter((f) =>
       novel.includes(`${f.path}::${f.metric}::${f.currCommit ?? "?"}`),
     );
+    const novelRanges = await buildCommitRanges(novelFindings);
     await ghApi(`/repos/${REPO}/issues/${existing.number}/comments`, {
       method: "POST",
-      body: JSON.stringify({ body: renderBody(novelFindings) }),
+      body: JSON.stringify({ body: renderBody(novelFindings, novelRanges) }),
     });
     return;
   }
