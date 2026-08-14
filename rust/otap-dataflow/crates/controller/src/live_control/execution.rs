@@ -183,6 +183,7 @@ impl<
 
     /// Drives one pipeline shutdown operation to completion or failure.
     pub(super) fn run_shutdown(self: Arc<Self>, plan: CandidateShutdownPlan) {
+        let started_at = Instant::now();
         self.update_shutdown(&plan.pipeline_key, &plan.shutdown.shutdown_id, |shutdown| {
             shutdown.state = ShutdownLifecycleState::Running;
         });
@@ -203,6 +204,12 @@ impl<
                         core.detail = Some(message.clone());
                     }
                 });
+                report_pipeline_shutdown_if_configured(
+                    &plan.pipeline_key,
+                    plan.context,
+                    started_at,
+                    Some("control_message_send"),
+                );
                 return;
             }
 
@@ -243,6 +250,12 @@ impl<
                                     core.detail = Some(error.message.clone());
                                 }
                             },
+                        );
+                        report_pipeline_shutdown_if_configured(
+                            &plan.pipeline_key,
+                            plan.context,
+                            started_at,
+                            Some("runtime_error"),
                         );
                         return;
                     }
@@ -295,6 +308,12 @@ impl<
                         }
                     }
                 });
+                report_pipeline_shutdown_if_configured(
+                    &plan.pipeline_key,
+                    plan.context,
+                    started_at,
+                    Some("timeout"),
+                );
                 return;
             }
 
@@ -304,6 +323,7 @@ impl<
         self.update_shutdown(&plan.pipeline_key, &plan.shutdown.shutdown_id, |shutdown| {
             shutdown.state = ShutdownLifecycleState::Succeeded;
         });
+        report_pipeline_shutdown_if_configured(&plan.pipeline_key, plan.context, started_at, None);
     }
 
     /// Creates a brand-new logical pipeline by launching all target instances.

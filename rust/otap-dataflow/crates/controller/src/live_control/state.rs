@@ -98,6 +98,29 @@ impl PanicReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stable operator-facing reason for a logical pipeline shutdown event.
+pub(super) enum PipelineShutdownReason {
+    /// A caller explicitly requested that the logical pipeline stop.
+    ShutdownRequest,
+}
+
+impl PipelineShutdownReason {
+    /// Returns the stable semantic-convention value for this reason.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ShutdownRequest => "shutdown_request",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Provenance attached to one operator-visible logical pipeline shutdown.
+pub(super) struct PipelineShutdownContext {
+    pub(super) initiator: OperationInitiator,
+    pub(super) reason: PipelineShutdownReason,
+}
+
 #[derive(Debug, Clone)]
 /// Error recorded when a deployed runtime instance exits unsuccessfully.
 pub(crate) struct RuntimeInstanceError {
@@ -618,6 +641,8 @@ pub(super) struct CandidateShutdownPlan {
     pub(super) target_instances: Vec<DeployedPipelineKey>,
     /// Per-instance shutdown timeout in seconds.
     pub(super) timeout_secs: u64,
+    /// Operator-visible provenance for the aggregate terminal event.
+    pub(super) context: Option<PipelineShutdownContext>,
 }
 
 /// Snapshot of active runtime generations for a logical pipeline.

@@ -27,6 +27,7 @@ use otap_df_telemetry::tracing_init::ProviderSetup;
 use otap_df_telemetry::{TracingSetup, otel_info};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
+use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -37,6 +38,148 @@ impl<S: Subscriber> Layer<S> for CountingLayer {
     fn on_event(&self, _event: &Event<'_>, _context: Context<'_, S>) {
         _ = self.0.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+#[derive(Debug)]
+struct CapturedEvent {
+    name: String,
+    level: tracing::Level,
+    strings: HashMap<String, String>,
+    doubles: HashMap<String, f64>,
+}
+
+#[derive(Clone, Default)]
+struct EventCaptureLayer(Arc<Mutex<Vec<CapturedEvent>>>);
+
+struct EventFieldVisitor<'a> {
+    strings: &'a mut HashMap<String, String>,
+    doubles: &'a mut HashMap<String, f64>,
+}
+
+impl Visit for EventFieldVisitor<'_> {
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        _ = self.doubles.insert(field.name().to_owned(), value);
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        _ = self
+            .strings
+            .insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        _ = self
+            .strings
+            .insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl<S: Subscriber> Layer<S> for EventCaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut strings = HashMap::new();
+        let mut doubles = HashMap::new();
+        event.record(&mut EventFieldVisitor {
+            strings: &mut strings,
+            doubles: &mut doubles,
+        });
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(CapturedEvent {
+                name: event.metadata().name().to_owned(),
+                level: *event.metadata().level(),
+                strings,
+                doubles,
+            });
+    }
+}
+
+/// Scenario: clean and timed-out logical pipeline shutdowns reach terminal instrumentation.
+/// Guarantees: each outcome emits one event with stable provenance, duration, and conditional error.type.
+#[test]
+fn pipeline_shutdown_event_has_stable_terminal_shape() {
+    let capture = EventCaptureLayer::default();
+    let events = Arc::clone(&capture.0);
+    let dispatch = tracing::Dispatch::new(Registry::default().with(capture));
+    let pipeline_key = PipelineKey::new("default".into(), "main".into());
+    let context = PipelineShutdownContext {
+        initiator: OperationInitiator::Dfctl,
+        reason: PipelineShutdownReason::ShutdownRequest,
+    };
+
+    tracing::dispatcher::with_default(&dispatch, || {
+        report_pipeline_shutdown(&pipeline_key, context, Instant::now(), None);
+        report_pipeline_shutdown(&pipeline_key, context, Instant::now(), Some("timeout"));
+    });
+
+    let events = events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(events.len(), 2);
+    let success = &events[0];
+    assert_eq!(success.name, "pipeline.shutdown");
+    assert_eq!(success.level, tracing::Level::INFO);
+    assert_eq!(success.strings["pipeline.group.id"], "default");
+    assert_eq!(success.strings["pipeline.id"], "main");
+    assert_eq!(success.strings["otap.pipeline.shutdown.initiator"], "dfctl");
+    assert_eq!(
+        success.strings["otap.pipeline.shutdown.reason"],
+        "shutdown_request"
+    );
+    assert!(success.doubles["otap.pipeline.shutdown.duration"] >= 0.0);
+    assert!(!success.strings.contains_key("error.type"));
+
+    let timeout = &events[1];
+    assert_eq!(timeout.level, tracing::Level::WARN);
+    assert_eq!(timeout.strings["error.type"], "timeout");
+}
+
+/// Scenario: a dfctl-originated explicit shutdown is prepared for a live logical pipeline.
+/// Guarantees: the aggregate plan retains both source and shutdown_request reason across worker dispatch.
+#[test]
+fn shutdown_plan_retains_operation_provenance() {
+    let config = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime = test_runtime(&config);
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    let plan = runtime
+        .prepare_shutdown_plan_for_engine_operation(
+            "g1",
+            "p1",
+            5,
+            None,
+            Some(PipelineShutdownContext {
+                initiator: OperationInitiator::Dfctl,
+                reason: PipelineShutdownReason::ShutdownRequest,
+            }),
+        )
+        .expect("shutdown plan should preserve provenance");
+
+    let context = plan
+        .context
+        .expect("explicit shutdown should emit an event");
+    assert_eq!(context.initiator, OperationInitiator::Dfctl);
+    assert_eq!(context.reason, PipelineShutdownReason::ShutdownRequest);
+    assert_eq!(plan.target_instances.len(), 1);
+}
+
+/// Scenario: pipeline deletion prepares an internal drain for a live pipeline.
+/// Guarantees: deletion does not emit the explicit pipeline.shutdown event.
+#[test]
+fn deletion_shutdown_plan_has_no_event_context() {
+    let config = engine_config_with_pipeline(simple_pipeline_yaml());
+    let runtime = test_runtime(&config);
+    register_existing_pipeline(&runtime, &config);
+    let _receiver =
+        register_runtime_instance(&runtime, "g1", "p1", 0, 0, RuntimeInstanceLifecycle::Active);
+
+    let plan = runtime
+        .prepare_shutdown_plan_for_engine_operation("g1", "p1", 5, None, None)
+        .expect("deletion drain plan should be prepared");
+
+    assert!(plan.context.is_none());
 }
 
 fn available_core_ids() -> Vec<CoreId> {

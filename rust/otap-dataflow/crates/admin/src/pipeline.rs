@@ -38,7 +38,7 @@
 use crate::AppState;
 use crate::convert::json_shape;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -290,7 +290,9 @@ pub async fn shutdown_pipeline(
     Path((pipeline_group_id, pipeline_id)): Path<(String, String)>,
     Query(params): Query<WaitParams>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let initiator = crate::operation_initiator(&headers);
     otel_info!(
         "pipeline.shutdown.requested",
         pipeline_group_id = pipeline_group_id.as_str(),
@@ -299,10 +301,12 @@ pub async fn shutdown_pipeline(
         timeout_secs = params.timeout_secs
     );
 
-    match state
-        .controller
-        .shutdown_pipeline(&pipeline_group_id, &pipeline_id, params.timeout_secs)
-    {
+    match state.controller.shutdown_pipeline_with_initiator(
+        &pipeline_group_id,
+        &pipeline_id,
+        params.timeout_secs,
+        initiator,
+    ) {
         Ok(shutdown) => {
             if !params.wait {
                 return (StatusCode::ACCEPTED, Json(shutdown)).into_response();
@@ -823,6 +827,7 @@ mod tests {
                 shutdown_status_result: Ok(None),
                 delete_result: Ok(delete_status("succeeded")),
             }))),
+            HeaderMap::new(),
         )
         .await
         .into_response();
@@ -856,6 +861,7 @@ mod tests {
                 shutdown_status_result: Ok(Some(shutdown_status("running"))),
                 delete_result: Ok(delete_status("succeeded")),
             }))),
+            HeaderMap::new(),
         )
         .await
         .into_response();

@@ -126,11 +126,21 @@ jobs:
           # `semconv/groups/event.<name>.yaml`; if it cannot be exercised
           # purely by the engine config, drop a script in
           # `semconv/triggers/` that drives it.
+          # The pipeline shutdown trigger runs last because it removes the
+          # data pipeline that hosts listeners used by other triggers.
           shopt -s nullglob
           for trigger in rust/otap-dataflow/semconv/triggers/*.sh; do
+            if [ "$(basename "$trigger")" = "pipeline.shutdown.sh" ]; then
+              continue
+            fi
             echo "--- $(basename "$trigger") ---"
             bash "$trigger"
           done
+          shutdown_trigger=rust/otap-dataflow/semconv/triggers/pipeline.shutdown.sh
+          if [ -f "$shutdown_trigger" ]; then
+            echo "--- $(basename "$shutdown_trigger") ---"
+            bash "$shutdown_trigger"
+          fi
       - name: Flush internal telemetry to weaver
         run: |
           # Allow the internal_telemetry receiver to drain and the OTLP
@@ -226,6 +236,9 @@ jobs:
             echo "| \`$name\` | $count | $worst |" >> "$GITHUB_STEP_SUMMARY"
             if [ "$count" = "0" ]; then
               echo "::error::declared event \`$name\` received zero samples"
+              fail=1
+            elif [ "$name" = "pipeline.shutdown" ] && [ "$count" != "1" ]; then
+              echo "::error::pipeline.shutdown received $count samples; expected exactly one aggregate event"
               fail=1
             elif [ "$worst" = "violation" ]; then
               echo "::error::event \`$name\` has event-level violations"

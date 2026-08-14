@@ -902,6 +902,10 @@ impl<
             pipeline_id,
             timeout_secs,
             None,
+            Some(PipelineShutdownContext {
+                initiator: OperationInitiator::Engine,
+                reason: PipelineShutdownReason::ShutdownRequest,
+            }),
         )
     }
 
@@ -911,6 +915,7 @@ impl<
         pipeline_id: &str,
         timeout_secs: u64,
         engine_operation_id: Option<&str>,
+        context: Option<PipelineShutdownContext>,
     ) -> Result<CandidateShutdownPlan, ControlPlaneError> {
         let pipeline_group_id: PipelineGroupId = pipeline_group_id.to_owned().into();
         let pipeline_id: PipelineId = pipeline_id.to_owned().into();
@@ -1001,6 +1006,7 @@ impl<
             shutdown,
             target_instances,
             timeout_secs: timeout_secs.max(1),
+            context,
         })
     }
 
@@ -1461,6 +1467,7 @@ impl<
                 &pipeline_id,
                 timeout_secs,
                 engine_operation_id,
+                None,
             ) {
                 Ok(initial_shutdown) => {
                     let terminal_shutdown = self.wait_for_shutdown_terminal(initial_shutdown);
@@ -1821,6 +1828,7 @@ impl<
         let runtime = Arc::clone(self);
         let rollout_runtime = Arc::clone(&runtime);
         let rollout_cleanup_runtime = Arc::clone(&runtime);
+        let tracing_setup = runtime.engine_tracing_setup.clone();
         let worker_pipeline_key = pipeline_key.clone();
         let worker_rollout_id = rollout_id.clone();
         let worker_thread_name = format!(
@@ -1831,16 +1839,18 @@ impl<
         let _rollout_handle = thread::Builder::new()
             .name(worker_thread_name.clone())
             .spawn(move || {
-                if let Err(panic) =
-                    catch_unwind(AssertUnwindSafe(|| rollout_runtime.run_rollout(plan)))
-                {
-                    rollout_cleanup_runtime.handle_rollout_worker_panic(
-                        &worker_pipeline_key,
-                        &worker_rollout_id,
-                        worker_thread_name,
-                        panic,
-                    );
-                }
+                tracing_setup.with_subscriber(|| {
+                    if let Err(panic) =
+                        catch_unwind(AssertUnwindSafe(|| rollout_runtime.run_rollout(plan)))
+                    {
+                        rollout_cleanup_runtime.handle_rollout_worker_panic(
+                            &worker_pipeline_key,
+                            &worker_rollout_id,
+                            worker_thread_name,
+                            panic,
+                        );
+                    }
+                });
             })
             .map_err(|err| {
                 runtime.finish_rollout(&pipeline_key, &rollout_id);
@@ -1869,6 +1879,9 @@ impl<
         let shutdown_cleanup_runtime = Arc::clone(&runtime);
         let worker_pipeline_key = pipeline_key.clone();
         let worker_shutdown_id = shutdown_id.clone();
+        let worker_context = plan.context;
+        let worker_started_at = Instant::now();
+        let tracing_setup = runtime.engine_tracing_setup.clone();
         let worker_thread_name = format!(
             "shutdown-{}-{}",
             pipeline_key.pipeline_group_id().as_ref(),
@@ -1877,22 +1890,36 @@ impl<
         let _shutdown_handle = thread::Builder::new()
             .name(worker_thread_name.clone())
             .spawn(move || {
-                if let Err(panic) =
-                    catch_unwind(AssertUnwindSafe(|| shutdown_runtime.run_shutdown(plan)))
-                {
-                    shutdown_cleanup_runtime.handle_shutdown_worker_panic(
-                        &worker_pipeline_key,
-                        &worker_shutdown_id,
-                        worker_thread_name,
-                        panic,
-                    );
-                }
+                tracing_setup.with_subscriber(|| {
+                    if let Err(panic) =
+                        catch_unwind(AssertUnwindSafe(|| shutdown_runtime.run_shutdown(plan)))
+                    {
+                        report_pipeline_shutdown_if_configured(
+                            &worker_pipeline_key,
+                            worker_context,
+                            worker_started_at,
+                            Some("panic"),
+                        );
+                        shutdown_cleanup_runtime.handle_shutdown_worker_panic(
+                            &worker_pipeline_key,
+                            &worker_shutdown_id,
+                            worker_thread_name,
+                            panic,
+                        );
+                    }
+                });
             })
             .map_err(|err| {
                 runtime.update_shutdown(&pipeline_key, &shutdown_id, |shutdown| {
                     shutdown.state = ShutdownLifecycleState::Failed;
                     shutdown.failure_reason = Some(err.to_string());
                 });
+                report_pipeline_shutdown_if_configured(
+                    &pipeline_key,
+                    worker_context,
+                    worker_started_at,
+                    Some("thread_spawn"),
+                );
                 ControlPlaneError::Internal {
                     message: err.to_string(),
                 }

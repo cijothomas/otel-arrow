@@ -1,0 +1,50 @@
+groups:
+  - id: registry.otap.pipeline.shutdown
+    type: attribute_group
+    display_name: OTAP Pipeline Shutdown Attributes
+    brief: >
+      Describes logical pipeline shutdown operations performed by df_engine.
+    attributes:
+      - id: pipeline.group.id
+        type: string
+        stability: development
+        brief: The identifier of the pipeline group containing the logical pipeline.
+        examples: [default]
+      - id: pipeline.id
+        type: string
+        stability: development
+        brief: The identifier of the logical pipeline that shut down.
+        examples: [main]
+      - id: otap.pipeline.shutdown.initiator
+        stability: development
+        brief: The source that initiated the lifecycle operation which caused shutdown.
+        type:
+          members:
+            - id: admin_api
+              value: admin_api
+              stability: development
+              brief: An otherwise unidentified client of the df_engine admin API.
+            - id: dfctl
+              value: dfctl
+              stability: development
+              brief: The dfctl command-line or interactive client.
+            - id: engine
+              value: engine
+              stability: development
+              brief: An engine-owned lifecycle action.
+        examples: [opamp, dfctl]
+      - id: otap.pipeline.shutdown.reason
+        stability: development
+        brief: The logical lifecycle action that required the pipeline to shut down.
+        type:
+          members:
+            - id: shutdown_request
+              value: shutdown_request
+              stability: development
+              brief: A caller explicitly requested logical pipeline shutdown.
+        examples: [shutdown_request]
+      - id: otap.pipeline.shutdown.duration
+        type: double
+        stability: development
+        brief: The wall-clock duration of the logical pipeline shutdown, in seconds.
+        examples: [0.056, 30.0]

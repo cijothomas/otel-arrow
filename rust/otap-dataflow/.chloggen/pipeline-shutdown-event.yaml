@@ -1,0 +1,7 @@
+change_type: enhancement
+component: observability
+note: "Emit pipeline.shutdown events with shutdown initiator, reason, duration, and failure classification."
+issues: [1613]
+subtext: >
+  Events aggregate all core instances of a logical pipeline and identify
+  explicit shutdown initiated through the admin API or dfctl.

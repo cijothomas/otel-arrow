@@ -1790,6 +1790,22 @@ impl<
         pipeline_id: &str,
         timeout_secs: u64,
     ) -> Result<ShutdownStatus, ControlPlaneError> {
+        self.request_shutdown_pipeline_with_initiator(
+            pipeline_group_id,
+            pipeline_id,
+            timeout_secs,
+            OperationInitiator::Engine,
+        )
+    }
+
+    /// Starts a tracked shutdown with the source that requested it.
+    pub(super) fn request_shutdown_pipeline_with_initiator(
+        self: &Arc<Self>,
+        pipeline_group_id: &str,
+        pipeline_id: &str,
+        timeout_secs: u64,
+        initiator: OperationInitiator,
+    ) -> Result<ShutdownStatus, ControlPlaneError> {
         // Keep the reservation alive until active_shutdowns contains the
         // accepted operation. A failure in the cancel-to-insert window is then
         // treated as part of shutdown instead of starting a replacement.
@@ -1805,6 +1821,10 @@ impl<
             pipeline_id,
             timeout_secs,
             None,
+            Some(PipelineShutdownContext {
+                initiator,
+                reason: PipelineShutdownReason::ShutdownRequest,
+            }),
         )
     }
 
@@ -1814,6 +1834,7 @@ impl<
         pipeline_id: &str,
         timeout_secs: u64,
         engine_operation_id: Option<&str>,
+        context: Option<PipelineShutdownContext>,
     ) -> Result<ShutdownStatus, ControlPlaneError> {
         self.cancel_runtime_recoveries_for_pipeline(&PipelineKey::new(
             pipeline_group_id.to_owned().into(),
@@ -1824,6 +1845,7 @@ impl<
             pipeline_id,
             timeout_secs,
             engine_operation_id,
+            context,
         )?;
         self.spawn_shutdown_for_engine_operation(plan, engine_operation_id)
     }

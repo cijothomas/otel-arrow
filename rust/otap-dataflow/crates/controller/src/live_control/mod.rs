@@ -19,7 +19,7 @@ use chrono::Utc;
 use otap_df_admin::{
     ConfigChangeAction, ConfigChangeStatus, ControlPlane, ControlPlaneError,
     EngineConfigReconcileRequest, EngineConfigReconcileState, EngineConfigReconcileStatus,
-    GroupDeleteStatus, PipelineDeleteStatus, PipelineDetails,
+    GroupDeleteStatus, OperationInitiator, PipelineDeleteStatus, PipelineDetails,
     PipelineRolloutState as ApiPipelineRolloutState,
     PipelineRolloutSummary as ApiPipelineRolloutSummary, ReconfigureRequest, RolloutCoreStatus,
     RolloutStatus, ShutdownCoreStatus, ShutdownStatus,
@@ -44,13 +44,61 @@ mod state;
 use self::state::TERMINAL_OPERATION_RETENTION_TTL;
 use self::state::{
     ActiveRuntimeCoreState, CandidateRolloutPlan, CandidateShutdownPlan, ControllerRuntimeState,
-    LogicalPipelineRecord, PipelineOperationKind, PipelineOperationReservationState, RolloutAction,
-    RolloutCoreProgress, RolloutExecutionError, RolloutLifecycleState, RolloutRecord,
-    RuntimeInstanceLifecycle, RuntimeInstanceRecord, RuntimeRecoveryState, ShutdownCoreProgress,
-    ShutdownLifecycleState, ShutdownRecord, TERMINAL_ROLLOUT_RETENTION_LIMIT,
-    TERMINAL_SHUTDOWN_RETENTION_LIMIT, TopicRuntimeProfile, is_expired, timestamp_now,
+    LogicalPipelineRecord, PipelineOperationKind, PipelineOperationReservationState,
+    PipelineShutdownContext, PipelineShutdownReason, RolloutAction, RolloutCoreProgress,
+    RolloutExecutionError, RolloutLifecycleState, RolloutRecord, RuntimeInstanceLifecycle,
+    RuntimeInstanceRecord, RuntimeRecoveryState, ShutdownCoreProgress, ShutdownLifecycleState,
+    ShutdownRecord, TERMINAL_ROLLOUT_RETENTION_LIMIT, TERMINAL_SHUTDOWN_RETENTION_LIMIT,
+    TopicRuntimeProfile, is_expired, timestamp_now,
 };
 pub(crate) use self::state::{PanicReport, RuntimeInstanceError, RuntimeInstanceExit};
+
+/// Emits one terminal event for an operator-visible logical pipeline shutdown.
+fn report_pipeline_shutdown(
+    pipeline_key: &PipelineKey,
+    context: PipelineShutdownContext,
+    started_at: Instant,
+    error_type: Option<&'static str>,
+) {
+    let duration = started_at.elapsed().as_secs_f64();
+    if let Some(error_type) = error_type {
+        otel_warn!(
+            "pipeline.shutdown",
+            {
+                pipeline.group.id = pipeline_key.pipeline_group_id().as_ref(),
+                pipeline.id = pipeline_key.pipeline_id().as_ref(),
+                otap.pipeline.shutdown.initiator = context.initiator.as_str(),
+                otap.pipeline.shutdown.reason = context.reason.as_str(),
+                otap.pipeline.shutdown.duration = duration,
+                error.type = error_type,
+            },
+            ""
+        );
+    } else {
+        otel_info!(
+            "pipeline.shutdown",
+            {
+                pipeline.group.id = pipeline_key.pipeline_group_id().as_ref(),
+                pipeline.id = pipeline_key.pipeline_id().as_ref(),
+                otap.pipeline.shutdown.initiator = context.initiator.as_str(),
+                otap.pipeline.shutdown.reason = context.reason.as_str(),
+                otap.pipeline.shutdown.duration = duration,
+            },
+            ""
+        );
+    }
+}
+
+fn report_pipeline_shutdown_if_configured(
+    pipeline_key: &PipelineKey,
+    context: Option<PipelineShutdownContext>,
+    started_at: Instant,
+    error_type: Option<&'static str>,
+) {
+    if let Some(context) = context {
+        report_pipeline_shutdown(pipeline_key, context, started_at, error_type);
+    }
+}
 
 /// Shared live-control runtime used by the admin control plane and workers.
 ///
@@ -479,6 +527,21 @@ impl<
     ) -> Result<ShutdownStatus, ControlPlaneError> {
         self.runtime
             .request_shutdown_pipeline(pipeline_group_id, pipeline_id, timeout_secs)
+    }
+
+    fn shutdown_pipeline_with_initiator(
+        &self,
+        pipeline_group_id: &str,
+        pipeline_id: &str,
+        timeout_secs: u64,
+        initiator: OperationInitiator,
+    ) -> Result<ShutdownStatus, ControlPlaneError> {
+        self.runtime.request_shutdown_pipeline_with_initiator(
+            pipeline_group_id,
+            pipeline_id,
+            timeout_secs,
+            initiator,
+        )
     }
 
     fn reconfigure_pipeline(

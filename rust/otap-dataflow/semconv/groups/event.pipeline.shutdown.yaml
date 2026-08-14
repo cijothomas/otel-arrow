@@ -1,0 +1,26 @@
+groups:
+  - id: event.otap.pipeline.shutdown
+    type: event
+    name: pipeline.shutdown
+    stability: development
+    brief: >
+      Emitted when an operator-visible logical pipeline shutdown attempt ends,
+      whether by completing successfully, failing, or timing out.
+    note: >
+      One event describes one logical pipeline operation across all deployed
+      core instances. Internal candidate and rollback cleanup do not emit this
+      event. Abrupt termination may prevent the event from being emitted.
+    attributes:
+      - ref: pipeline.group.id
+        requirement_level: required
+      - ref: pipeline.id
+        requirement_level: required
+      - ref: otap.pipeline.shutdown.initiator
+        requirement_level: required
+      - ref: otap.pipeline.shutdown.reason
+        requirement_level: required
+      - ref: otap.pipeline.shutdown.duration
+        requirement_level: required
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the shutdown attempt did not complete successfully.

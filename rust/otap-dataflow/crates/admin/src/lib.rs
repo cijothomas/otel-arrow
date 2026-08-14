@@ -98,6 +98,38 @@ impl ControlPlaneError {
     }
 }
 
+/// Stable source classification for lifecycle operations submitted to the control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationInitiator {
+    /// A request received through the admin HTTP API from an otherwise unidentified client.
+    AdminApi,
+    /// A request submitted by the `dfctl` client.
+    Dfctl,
+    /// An engine-owned lifecycle action rather than an external request.
+    Engine,
+}
+
+impl OperationInitiator {
+    /// Returns the stable semantic-convention value for this initiator.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdminApi => "admin_api",
+            Self::Dfctl => "dfctl",
+            Self::Engine => "engine",
+        }
+    }
+}
+
+/// Classifies the best-effort initiator of an admin HTTP request.
+pub(crate) fn operation_initiator(headers: &axum::http::HeaderMap) -> OperationInitiator {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("dfctl/"))
+        .map_or(OperationInitiator::AdminApi, |_| OperationInitiator::Dfctl)
+}
+
 /// Control-plane interface implemented by the controller runtime.
 pub trait ControlPlane: Send + Sync {
     /// Requests shutdown of all currently running runtime instances.
@@ -110,6 +142,17 @@ pub trait ControlPlane: Send + Sync {
         pipeline_id: &str,
         timeout_secs: u64,
     ) -> Result<ShutdownStatus, ControlPlaneError>;
+
+    /// Requests logical pipeline shutdown and records who initiated it.
+    fn shutdown_pipeline_with_initiator(
+        &self,
+        pipeline_group_id: &str,
+        pipeline_id: &str,
+        timeout_secs: u64,
+        _initiator: OperationInitiator,
+    ) -> Result<ShutdownStatus, ControlPlaneError> {
+        self.shutdown_pipeline(pipeline_group_id, pipeline_id, timeout_secs)
+    }
 
     /// Reconfigures a logical pipeline and returns the rollout job snapshot.
     fn reconfigure_pipeline(
@@ -404,6 +447,47 @@ pub async fn run(
             addr: addr.to_string(),
             details: format!("{e}"),
         })
+}
+
+#[cfg(test)]
+mod operation_initiator_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    /// Scenario: every lifecycle initiator is rendered for semantic-convention attributes.
+    /// Guarantees: initiator values remain stable and low-cardinality.
+    #[test]
+    fn initiator_values_are_stable() {
+        assert_eq!(OperationInitiator::AdminApi.as_str(), "admin_api");
+        assert_eq!(OperationInitiator::Dfctl.as_str(), "dfctl");
+        assert_eq!(OperationInitiator::Engine.as_str(), "engine");
+    }
+
+    /// Scenario: dfctl sends its versioned User-Agent to an admin mutation endpoint.
+    /// Guarantees: version suffixes do not increase telemetry cardinality.
+    #[test]
+    fn dfctl_user_agent_is_classified() {
+        let mut headers = HeaderMap::new();
+        _ = headers.insert(header::USER_AGENT, HeaderValue::from_static("dfctl/0.50.0"));
+
+        assert_eq!(operation_initiator(&headers), OperationInitiator::Dfctl);
+    }
+
+    /// Scenario: an admin request has no recognized dfctl User-Agent prefix.
+    /// Guarantees: unknown and absent client identities use the bounded admin_api fallback.
+    #[test]
+    fn unknown_user_agent_is_admin_api() {
+        let mut headers = HeaderMap::new();
+        _ = headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("automation-dfctl-compatible/1"),
+        );
+        assert_eq!(operation_initiator(&headers), OperationInitiator::AdminApi);
+        assert_eq!(
+            operation_initiator(&HeaderMap::new()),
+            OperationInitiator::AdminApi
+        );
+    }
 }
 
 #[cfg(test)]

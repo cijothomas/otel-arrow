@@ -64,7 +64,8 @@ pub fn resolve_connection(args: &ConnectionArgs) -> Result<ResolvedConnection, C
 
     let endpoint = AdminEndpoint::from_url(&url)
         .map_err(|err| CliError::config(format!("invalid admin endpoint '{url}': {err}")))?;
-    let mut settings = HttpAdminClientSettings::new(endpoint);
+    let mut settings = HttpAdminClientSettings::new(endpoint)
+        .with_user_agent(format!("dfctl/{}", env!("CARGO_PKG_VERSION")));
 
     if let Some(connect_timeout) = args.connect_timeout.or(profile.connect_timeout) {
         settings = settings.with_connect_timeout(connect_timeout);

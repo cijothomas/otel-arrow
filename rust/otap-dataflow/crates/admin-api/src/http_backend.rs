@@ -621,6 +621,10 @@ fn build_http_client(settings: &HttpAdminClientSettings) -> Result<reqwest::Clie
         .connect_timeout(settings.connect_timeout)
         .tcp_nodelay(settings.tcp_nodelay);
 
+    if let Some(user_agent) = &settings.user_agent {
+        client_builder = client_builder.user_agent(user_agent);
+    }
+
     if let Some(tcp_keepalive) = settings.tcp_keepalive {
         client_builder = client_builder.tcp_keepalive(tcp_keepalive);
     }

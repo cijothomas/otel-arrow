@@ -48,5 +48,26 @@ argument to `otel_info!` / `otel_warn!` / `otel_debug!` /
    that directory is run before validation. The live-check job
    fails if any declared event receives zero samples.
 
+## Pipeline shutdown events
+
+`pipeline.shutdown` describes the terminal outcome of an operator-visible
+logical pipeline shutdown. One event aggregates all deployed core instances
+targeted by the operation. Internal candidate and rollback cleanup do not emit
+this event.
+
+The `otap.pipeline.shutdown.initiator` attribute identifies the source that
+submitted the lifecycle operation. The `otap.pipeline.shutdown.reason`
+attribute identifies why the serving pipeline instances stopped. For example,
+an explicit dfctl shutdown uses `dfctl` and `shutdown_request`.
+
+`dfctl` identifies itself through its HTTP User-Agent. This is best-effort client
+attribution, not an authenticated caller identity. Other admin HTTP clients are
+reported as `admin_api`.
+
+Successful shutdowns omit `error.type`. Failed shutdowns set a stable,
+low-cardinality error classification such as `timeout`. Abrupt termination,
+including SIGKILL or host loss, can prevent the event from being emitted, so
+absence of the event does not by itself prove an unclean shutdown.
+
 [weaver]: https://github.com/open-telemetry/weaver
 [events]: ../crates/telemetry/src/internal_events.rs
