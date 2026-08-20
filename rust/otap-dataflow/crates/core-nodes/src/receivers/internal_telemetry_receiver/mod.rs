@@ -460,8 +460,7 @@ impl InternalTelemetryReceiver {
             loop {
                 if std::time::Instant::now() >= deadline {
                     return Err(Error::InternalError {
-                        message: "timed out while flushing internal logs during shutdown"
-                            .to_owned(),
+                        message: "timed out while flushing internal logs during shutdown; remaining terminal telemetry was not flushed".to_owned(),
                     });
                 }
                 let Ok(event) = internal.logs_receiver.try_recv() else {
@@ -482,8 +481,7 @@ impl InternalTelemetryReceiver {
                     )
                     .await
                     .map_err(|_| Error::InternalError {
-                        message: "timed out while flushing internal logs during shutdown"
-                            .to_owned(),
+                        message: "timed out while flushing internal logs during shutdown; remaining terminal telemetry was not flushed".to_owned(),
                     })??;
                 }
             }
@@ -1037,7 +1035,7 @@ mod tests {
 
             let deadline = StdInstant::now() + Duration::from_millis(50);
             let result = tokio::time::timeout(
-                Duration::from_millis(250),
+                Duration::from_secs(1),
                 InternalTelemetryReceiver::flush_terminal_telemetry(
                     &effect_handler,
                     &internal,
@@ -1049,9 +1047,12 @@ mod tests {
             )
             .await
             .expect("terminal log drain must not outlive the shutdown deadline");
+            let error = result.expect_err("the bounded terminal log drain should time out");
             assert!(
-                result.is_err(),
-                "the bounded terminal log drain should time out"
+                error
+                    .to_string()
+                    .contains("remaining terminal telemetry was not flushed"),
+                "unexpected timeout error: {error}"
             );
         }));
     }
