@@ -445,6 +445,9 @@ impl local::Receiver<OtapPdata> for InternalTelemetryReceiver {
 
 impl InternalTelemetryReceiver {
     /// Drains queued logs and performs the final bounded metric-registry drain.
+    ///
+    /// The deadline is observed between log records and while awaiting downstream
+    /// capacity. Synchronous encoding of the current record runs to completion.
     async fn flush_terminal_telemetry(
         effect_handler: &local::EffectHandler<OtapPdata>,
         internal: &otap_df_telemetry::InternalTelemetrySettings,
@@ -454,18 +457,34 @@ impl InternalTelemetryReceiver {
         deadline: std::time::Instant,
     ) -> Result<(), Error> {
         if logs_enabled {
-            while let Ok(event) = internal.logs_receiver.try_recv() {
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::InternalError {
+                        message: "timed out while flushing internal logs during shutdown"
+                            .to_owned(),
+                    });
+                }
+                let Ok(event) = internal.logs_receiver.try_recv() else {
+                    break;
+                };
                 if let ObservedEvent::Log(log_event) = event {
                     if let Some(log_tap) = internal.log_tap.as_ref() {
                         log_tap.record(log_event.clone());
                     }
-                    Self::send_log_event(
-                        effect_handler,
-                        log_event,
-                        &internal.resource_field_bytes,
-                        scope_cache,
+                    tokio::time::timeout_at(
+                        Instant::from_std(deadline),
+                        Self::send_log_event(
+                            effect_handler,
+                            log_event,
+                            &internal.resource_field_bytes,
+                            scope_cache,
+                        ),
                     )
-                    .await?;
+                    .await
+                    .map_err(|_| Error::InternalError {
+                        message: "timed out while flushing internal logs during shutdown"
+                            .to_owned(),
+                    })??;
                 }
             }
         }
@@ -576,7 +595,7 @@ mod tests {
     use otap_df_telemetry_macros::metric_set;
     use prost::Message as _;
     use std::collections::HashMap;
-    use std::time::{Duration, Instant as StdInstant};
+    use std::time::{Duration, Instant as StdInstant, SystemTime};
     use tokio_util::sync::CancellationToken;
 
     #[metric_set(name = "receiver.internal_telemetry.test")]
@@ -965,6 +984,75 @@ mod tests {
 
             drop(output_rx);
             drop(logs_sender);
+        }));
+    }
+
+    /// Scenario: a queued terminal log cannot enter a full downstream channel during shutdown.
+    /// Guarantees: terminal log draining stops at the shutdown deadline instead of blocking.
+    #[test]
+    fn shutdown_bounds_terminal_log_drain_blocked_by_downstream_backpressure() {
+        let (runtime, local_tasks) = setup_test_runtime();
+        runtime.block_on(local_tasks.run_until(async move {
+            let registry = TelemetryRegistryHandle::new();
+            let (logs_sender, logs_receiver) = flume::bounded(1);
+            let record = otap_df_telemetry::__log_record_impl!(
+                otap_df_telemetry::Level::INFO,
+                "internal_telemetry.test.terminal_log",
+                message = "queued terminal log"
+            )
+            .into_record(LogContext::new());
+            logs_sender
+                .send(ObservedEvent::Log(LogEvent {
+                    time: SystemTime::now(),
+                    record,
+                }))
+                .expect("terminal log should enqueue");
+            let internal = otap_df_telemetry::InternalTelemetrySettings {
+                logs_receiver,
+                resource_field_bytes: ResourceLogs::default().encode_to_vec().into(),
+                registry: registry.clone(),
+                default_metric_drain_interval: Duration::from_secs(60),
+                log_tap: None,
+            };
+            let mut scope_cache = ScopeToBytesMap::new(registry);
+
+            let (output_tx, _output_rx) = create_not_send_channel(1);
+            output_tx
+                .send(OtapPdata::new(
+                    Context::default(),
+                    OtlpProtoBytes::ExportLogsRequest(Bytes::new()).into(),
+                ))
+                .expect("downstream blocker should enqueue");
+            let mut outputs = HashMap::new();
+            let _ = outputs.insert("".into(), EngineSender::Local(LocalSender::mpsc(output_tx)));
+            let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel(1);
+            let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+            let effect_handler = local::EffectHandler::new(
+                test_node("internal_telemetry_receiver"),
+                outputs,
+                None,
+                runtime_ctrl_tx,
+                metrics_reporter,
+            );
+
+            let deadline = StdInstant::now() + Duration::from_millis(50);
+            let result = tokio::time::timeout(
+                Duration::from_millis(250),
+                InternalTelemetryReceiver::flush_terminal_telemetry(
+                    &effect_handler,
+                    &internal,
+                    true,
+                    &mut scope_cache,
+                    None,
+                    deadline,
+                ),
+            )
+            .await
+            .expect("terminal log drain must not outlive the shutdown deadline");
+            assert!(
+                result.is_err(),
+                "the bounded terminal log drain should time out"
+            );
         }));
     }
 
